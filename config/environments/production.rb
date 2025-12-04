@@ -18,7 +18,7 @@ Rails.application.configure do
   config.active_support.report_deprecations = false
 
   config.cache_store = :solid_cache_store
-  config.active_job.queue_adapter = :solid_queue
+  config.active_job.queue_adapter = :async
   config.solid_queue.connects_to = { database: { writing: :queue } }
 
   config.i18n.fallbacks = true
