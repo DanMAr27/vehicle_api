@@ -38,7 +38,7 @@ gem "rack-cors"
 # ============================================
 # API CON GRAPE
 # ============================================
-gem "grape", "~> 2.2"           # Framework para construir APIs REST
+gem "grape", "~> 3.0"           # Framework para construir APIs REST
 gem "grape-entity", "~> 1.0"    # Serialización de respuestas
 gem "grape-swagger", "~> 2.1"   # Documentación Swagger automática
 gem "grape-swagger-rails", "~> 0.7" # UI de Swagger para visualizar la documentación
