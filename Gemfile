@@ -46,7 +46,7 @@ gem "grape-swagger-rails", "~> 0.7" # UI de Swagger para visualizar la documenta
 # ============================================
 # AUDITORÍA Y SOFT DELETES
 # ============================================
-gem "paper_trail", "~> 16.0" # Versionado y auditoría de cambios
+gem "paper_trail", "~> 17.0" # Versionado y auditoría de cambios
 gem "discard", "~> 1.3"     # Soft deletes (borrado lógico)
 
 # ============================================
