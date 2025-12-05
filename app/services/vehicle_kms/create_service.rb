@@ -1,7 +1,5 @@
 # ============================================================
 # app/services/vehicle_kms/create_service.rb
-#
-# Servicio para crear registros de KM y revalidar ventana
 # ============================================================
 module VehicleKms
   class CreateService
@@ -19,7 +17,7 @@ module VehicleKms
 
       ActiveRecord::Base.transaction do
         create_km_record
-        detect_and_mark_conflicts_in_window
+        process_conflicts
         update_vehicle_current_km
         success
       end
@@ -48,33 +46,38 @@ module VehicleKms
       )
     end
 
-    def detect_and_mark_conflicts_in_window
-      # Ejecutar detector
+    def process_conflicts
       detector = ConflictDetectorService.new(@vehicle_km)
       result = detector.call
 
-      # Actualizar TODOS los registros en la ventana según el resultado
-      result[:conflicts_by_id].each do |record_id, conflict_info|
-        record = result[:window_records].find { |r| r.id == record_id }
-        next unless record
-
-        if conflict_info[:is_conflictive]
-          # Marcar como conflictivo
+      if result[:has_conflict]
+        # Actualizar TODOS los registros conflictivos detectados
+        result[:conflictive_records].each do |conflict_info|
+          record = VehicleKm.find(conflict_info[:record_id])
           record.update!(
             status: "conflictivo",
             conflict_reasons_list: conflict_info[:reasons],
-            correction_notes: "Detectado como conflictivo en validación de ventana"
+            correction_notes: "Rompe monotonicidad - detectado por análisis de ventana"
           )
-        else
-          # Si estaba conflictivo y ahora es válido, restaurar
+        end
+
+        # Restaurar registros que ahora son válidos
+        result[:valid_records].each do |valid_id|
+          record = VehicleKm.find(valid_id)
           if record.status == "conflictivo"
             record.update!(
               status: "original",
               conflict_reasons_list: [],
-              correction_notes: "Conflicto resuelto tras inserción de nuevo registro"
+              correction_notes: "Monotonicidad restaurada tras nueva inserción"
             )
           end
         end
+      else
+        # No hay conflicto
+        @vehicle_km.update!(
+          status: "original",
+          conflict_reasons_list: []
+        )
       end
     end
 
