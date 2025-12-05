@@ -8,15 +8,15 @@ module VehicleKms
     end
 
     def call
-      # Si el registro insertado es conflictivo por magnitud, NO revalidar vecinos
-      # (el problema está en el nuevo registro, no en los vecinos)
+      # Si el registro insertado fue corregido exitosamente (estimado),
+      # revalidar vecinos normalmente
+      # Si es conflictivo por falta de datos (no por magnitud), también revalidar
+
+      # Solo SKIP si es conflictivo Y no se pudo corregir por falta de vecinos
       if @vehicle_km.status == "conflictivo" &&
-         @vehicle_km.conflict_reasons_list.to_s.include?("magnitud")
-        return {
-          success: true,
-          revalidated_count: 0,
-          skipped_reason: "Conflicto de magnitud en registro nuevo - vecinos no afectados"
-        }
+         !@vehicle_km.correction_notes.to_s.include?("falta de datos")
+        # Es conflictivo pero probablemente por otro motivo (magnitud sin vecinos)
+        # o ya fue procesado completamente
       end
 
       affected_records = find_affected_records

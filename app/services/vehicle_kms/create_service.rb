@@ -50,11 +50,14 @@ module VehicleKms
       magnitude_validator = MagnitudeValidationService.new(@vehicle_km)
       magnitude_result = magnitude_validator.call
 
-      if magnitude_result[:has_magnitude_issue]
-        # Error de magnitud extrema → CONFLICTIVO directo, NO intentar corrección
+      # Si hay error de magnitud pero NO se puede interpolar → CONFLICTIVO directo
+      if magnitude_result[:has_magnitude_issue] && !magnitude_result[:can_interpolate]
         mark_as_conflictive_magnitude(magnitude_result[:issues])
         return
       end
+
+      # Si hay error de magnitud pero SÍ se puede interpolar → continuar para corregir
+      # (se manejará en check_result más adelante)
 
       # PASO 2: Detectar outlier en contexto
       outlier_detector = OutlierDetectionService.new(@vehicle_km)
@@ -76,8 +79,22 @@ module VehicleKms
       checker = CorrelationCheckService.new(@vehicle_km)
       check_result = checker.call
 
-      # PASO 5: Si no hay conflictos, dejar como original
-      unless check_result[:has_conflict]
+      # PASO 5: Combinar conflictos de magnitud con conflictos de correlación
+      all_conflicts = check_result[:conflicts].dup
+      if magnitude_result[:has_magnitude_issue]
+        # Agregar los conflictos de magnitud pero con severity MEDIUM (es corregible)
+        magnitude_result[:issues].each do |issue|
+          all_conflicts << {
+            type: issue[:type],
+            message: issue[:message],
+            severity: "medium", # Es corregible por interpolación
+            magnitude_issue: true
+          }
+        end
+      end
+
+      # PASO 6: Si no hay conflictos, dejar como original
+      if all_conflicts.empty?
         @vehicle_km.update!(
           status: "original",
           confidence_level: nil,
@@ -86,15 +103,15 @@ module VehicleKms
         return
       end
 
-      # PASO 6: Evaluar severidad y decidir acción
-      high_severity_conflicts = check_result[:conflicts].select { |c| c[:severity] == "high" }
+      # PASO 7: Evaluar severidad y decidir acción
+      high_severity_conflicts = all_conflicts.select { |c| c[:severity] == "high" }
 
       if high_severity_conflicts.any?
         # NO se puede corregir (faltan datos) → conflictivo
-        mark_as_conflictive(check_result[:conflicts])
+        mark_as_conflictive(all_conflicts)
       else
         # SÍ se puede corregir → intentar corrección
-        attempt_correction_with_confidence(check_result)
+        attempt_correction_with_confidence(all_conflicts)
       end
     end
 
@@ -131,9 +148,9 @@ module VehicleKms
       )
     end
 
-    def attempt_correction_with_confidence(check_result)
+    def attempt_correction_with_confidence(conflicts)
       unless @vehicle.company.auto_correction_enabled
-        mark_as_conflictive(check_result[:conflicts])
+        mark_as_conflictive(conflicts)
         return
       end
 
@@ -144,15 +161,21 @@ module VehicleKms
       correction_result = corrector.call
 
       if correction_result[:success] && correction_result[:corrected_km]
+        # Agregar nota si había error de magnitud
+        notes = correction_result[:notes]
+        if conflicts.any? { |c| c[:magnitude_issue] }
+          notes += " [CORREGIDO: Error de magnitud extrema detectado y corregido automáticamente]"
+        end
+
         @vehicle_km.update!(
           km_normalized: correction_result[:corrected_km],
           status: "estimado",
           confidence_level: confidence[:level],
           conflict_reasons_list: [],
-          correction_notes: correction_result[:notes]
+          correction_notes: notes
         )
       else
-        mark_as_conflictive(check_result[:conflicts])
+        mark_as_conflictive(conflicts)
       end
     end
 

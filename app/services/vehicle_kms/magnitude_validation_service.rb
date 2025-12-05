@@ -33,7 +33,8 @@ module VehicleKms
       {
         has_magnitude_issue: issues.any?,
         issues: issues,
-        severity: issues.any? ? "high" : nil
+        severity: issues.any? ? "high" : nil,
+        can_interpolate: prev_record.present? && next_record.present?
       }
     end
 
