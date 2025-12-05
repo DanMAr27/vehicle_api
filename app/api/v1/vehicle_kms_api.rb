@@ -45,7 +45,8 @@ module V1
       post do
         result = VehicleKms::CreateService.new(
           vehicle_id: params[:vehicle_id],
-          params: declared_params
+          params: declared(params, include_missing: false)
+
         ).call
 
         if result[:success]
