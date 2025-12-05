@@ -57,7 +57,7 @@ module VehicleKms
           record.update!(
             status: "conflictivo",
             conflict_reasons_list: conflict_info[:reasons],
-            correction_notes: "Rompe monotonicidad - detectado por análisis de ventana"
+            correction_notes: "No forma parte de la secuencia creciente más coherente"
           )
         end
 
@@ -68,7 +68,7 @@ module VehicleKms
             record.update!(
               status: "original",
               conflict_reasons_list: [],
-              correction_notes: "Monotonicidad restaurada tras nueva inserción"
+              correction_notes: "Restaurado a secuencia válida tras nueva inserción"
             )
           end
         end
