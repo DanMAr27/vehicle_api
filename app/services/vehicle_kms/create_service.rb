@@ -41,20 +41,29 @@ module VehicleKms
         source_record_id: @params[:source_record_id],
         km_reported: @params[:km_reported],
         km_normalized: @params[:km_reported],
-        status: "original" # Temporalmente, se ajustará en process_validation_and_correction
+        status: "original"
       )
     end
 
     def process_validation_and_correction
-      # PASO 1: Detectar si hay outlier en el contexto ANTES de validar el registro actual
+      # PASO 1: Validación de magnitud (detecta errores EXTREMOS como 30k→80k)
+      magnitude_validator = MagnitudeValidationService.new(@vehicle_km)
+      magnitude_result = magnitude_validator.call
+
+      if magnitude_result[:has_magnitude_issue]
+        # Error de magnitud extrema → CONFLICTIVO directo, NO intentar corrección
+        mark_as_conflictive_magnitude(magnitude_result[:issues])
+        return
+      end
+
+      # PASO 2: Detectar outlier en contexto
       outlier_detector = OutlierDetectionService.new(@vehicle_km)
       outlier_result = outlier_detector.call
 
-      # PASO 2: Si HAY outlier y NO es el registro actual → el contexto tiene el problema
+      # PASO 3: Si hay outlier y NO es el registro actual → marcar el outlier
       if outlier_result[:has_outlier] && !outlier_result[:is_current_record]
         handle_outlier_in_context(outlier_result[:outlier_record])
 
-        # El registro actual es consistente con la mayoría, queda como original
         @vehicle_km.update!(
           status: "original",
           confidence_level: nil,
@@ -63,11 +72,11 @@ module VehicleKms
         return
       end
 
-      # PASO 3: Verificar conflictos del registro actual
+      # PASO 4: Verificar correlación temporal (regresión, futuro inconsistente)
       checker = CorrelationCheckService.new(@vehicle_km)
       check_result = checker.call
 
-      # PASO 4: Si no hay conflictos, dejar como original
+      # PASO 5: Si no hay conflictos, dejar como original
       unless check_result[:has_conflict]
         @vehicle_km.update!(
           status: "original",
@@ -77,22 +86,29 @@ module VehicleKms
         return
       end
 
-      # PASO 5: Evaluar si se puede corregir basado en severidad
-      # HIGH = no se puede corregir (faltan datos para interpolar)
-      # MEDIUM = sí se puede corregir (hay suficientes datos)
+      # PASO 6: Evaluar severidad y decidir acción
       high_severity_conflicts = check_result[:conflicts].select { |c| c[:severity] == "high" }
 
       if high_severity_conflicts.any?
-        # NO se puede corregir: faltan registros vecinos → conflictivo
+        # NO se puede corregir (faltan datos) → conflictivo
         mark_as_conflictive(check_result[:conflicts])
       else
-        # SÍ se puede corregir: hay registros antes y después → intentar corrección
+        # SÍ se puede corregir → intentar corrección
         attempt_correction_with_confidence(check_result)
       end
     end
 
+    def mark_as_conflictive_magnitude(issues)
+      @vehicle_km.update!(
+        status: "conflictivo",
+        km_normalized: @vehicle_km.km_reported,
+        confidence_level: nil,
+        conflict_reasons_list: issues.map { |i| i[:message] },
+        correction_notes: "Error de magnitud extrema detectado. Posible error de entrada de datos. Requiere revisión manual."
+      )
+    end
+
     def handle_outlier_in_context(outlier_record)
-      # Marcar el outlier detectado como conflictivo
       outlier_record.update!(
         status: "conflictivo",
         km_normalized: outlier_record.km_reported,
@@ -111,27 +127,23 @@ module VehicleKms
         km_normalized: @vehicle_km.km_reported,
         confidence_level: nil,
         conflict_reasons_list: conflicts.map { |c| c[:message] },
-        correction_notes: "Conflicto detectado: #{conflicts.map { |c| c[:type] }.join(', ')}. No se puede corregir automáticamente."
+        correction_notes: "Conflicto detectado: #{conflicts.map { |c| c[:type] }.join(', ')}. No se puede corregir automáticamente por falta de datos."
       )
     end
 
     def attempt_correction_with_confidence(check_result)
-      # Verificar si la corrección automática está habilitada en la empresa
       unless @vehicle.company.auto_correction_enabled
         mark_as_conflictive(check_result[:conflicts])
         return
       end
 
-      # Calcular nivel de confianza para la corrección
       confidence_calculator = ConfidenceCalculatorService.new(@vehicle_km)
       confidence = confidence_calculator.call
 
-      # Intentar corrección
       corrector = KmCorrectionService.new(@vehicle_km)
       correction_result = corrector.call
 
       if correction_result[:success] && correction_result[:corrected_km]
-        # Corrección exitosa
         @vehicle_km.update!(
           km_normalized: correction_result[:corrected_km],
           status: "estimado",
@@ -140,13 +152,11 @@ module VehicleKms
           correction_notes: correction_result[:notes]
         )
       else
-        # No se pudo calcular corrección (no debería pasar con severity medium)
         mark_as_conflictive(check_result[:conflicts])
       end
     end
 
     def revalidate_affected_window
-      # Solo si es inserción a pasado (fecha anterior a hoy)
       return if @params[:input_date] >= Date.today
 
       revalidator = WindowRevalidationService.new(@vehicle_km)

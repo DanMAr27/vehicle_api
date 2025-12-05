@@ -1,13 +1,24 @@
 # app/services/vehicle_kms/window_revalidation_service.rb
 module VehicleKms
   class WindowRevalidationService
-    NEIGHBORS_COUNT = 5 # Número de registros antes/después a revisar
+    NEIGHBORS_COUNT = 5
 
     def initialize(vehicle_km)
       @vehicle_km = vehicle_km
     end
 
     def call
+      # Si el registro insertado es conflictivo por magnitud, NO revalidar vecinos
+      # (el problema está en el nuevo registro, no en los vecinos)
+      if @vehicle_km.status == "conflictivo" &&
+         @vehicle_km.conflict_reasons_list.to_s.include?("magnitud")
+        return {
+          success: true,
+          revalidated_count: 0,
+          skipped_reason: "Conflicto de magnitud en registro nuevo - vecinos no afectados"
+        }
+      end
+
       affected_records = find_affected_records
 
       affected_records.each do |record|
@@ -23,7 +34,6 @@ module VehicleKms
     private
 
     def find_affected_records
-      # Buscar N registros antes y N registros después
       before = VehicleKm.kept
                        .where(vehicle_id: @vehicle_km.vehicle_id)
                        .where("input_date < ? OR (input_date = ? AND id < ?)",
@@ -48,12 +58,18 @@ module VehicleKms
     end
 
     def revalidate_record(record)
-      # PASO 1: Verificar si este registro ahora es un outlier
+      # PASO 1: Verificar si el registro insertado que causó la revalidación es conflictivo
+      # Si es así, NO marcar a este registro como conflictivo
+      if @vehicle_km.status == "conflictivo"
+        # El problema está en el registro nuevo, este registro probablemente está bien
+        return
+      end
+
+      # PASO 2: Verificar si este registro ahora es un outlier
       outlier_detector = OutlierDetectionService.new(record)
       outlier_result = outlier_detector.call
 
       if outlier_result[:has_outlier] && outlier_result[:is_current_record]
-        # Este registro es ahora un outlier → marcar como conflictivo
         record.update!(
           status: "conflictivo",
           km_normalized: record.km_reported,
@@ -63,7 +79,7 @@ module VehicleKms
         return
       end
 
-      # PASO 2: Si había sido marcado como outlier pero ya no lo es → resolver
+      # PASO 3: Si había sido marcado como outlier pero ya no lo es
       if !outlier_result[:has_outlier] &&
          record.status == "conflictivo" &&
          record.conflict_reasons_list.to_s.include?("outlier")
@@ -77,11 +93,10 @@ module VehicleKms
         return
       end
 
-      # PASO 3: Validación normal de correlación
+      # PASO 4: Validación normal de correlación
       checker = CorrelationCheckService.new(record)
       check_result = checker.call
 
-      # Si ya no hay conflictos y estaba marcado como conflictivo, actualizar
       if !check_result[:has_conflict] && record.status == "conflictivo"
         record.update!(
           status: "original",
@@ -92,13 +107,10 @@ module VehicleKms
         return
       end
 
-      # Si ahora hay conflictos y estaba como original, re-evaluar
       if check_result[:has_conflict] && (record.status == "original" || record.status == "estimado")
-        # Evaluar severidad
         high_severity = check_result[:conflicts].any? { |c| c[:severity] == "high" }
 
         if high_severity
-          # No se puede corregir → conflictivo
           record.update!(
             status: "conflictivo",
             km_normalized: record.km_reported,
@@ -106,14 +118,12 @@ module VehicleKms
             correction_notes: "Conflicto detectado tras inserción de nuevo registro. No se puede corregir automáticamente."
           )
         else
-          # Se puede corregir → intentar corrección
           attempt_revalidation_correction(record, check_result)
         end
       end
     end
 
     def attempt_revalidation_correction(record, check_result)
-      # Verificar si la corrección está habilitada
       unless record.company.auto_correction_enabled
         record.update!(
           status: "conflictivo",
@@ -123,11 +133,9 @@ module VehicleKms
         return
       end
 
-      # Calcular confianza
       confidence_calculator = ConfidenceCalculatorService.new(record)
       confidence = confidence_calculator.call
 
-      # Intentar corrección
       corrector = KmCorrectionService.new(record)
       correction_result = corrector.call
 
