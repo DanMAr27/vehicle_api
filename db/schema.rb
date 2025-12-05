@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 5) do
+ActiveRecord::Schema[8.0].define(version: 7) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -20,6 +20,9 @@ ActiveRecord::Schema[8.0].define(version: 5) do
     t.datetime "discarded_at"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.integer "max_daily_km_tolerance"
+    t.boolean "auto_correction_enabled", default: true
+    t.integer "min_neighbors_for_correction", default: 1
     t.index ["discarded_at"], name: "index_companies_on_discarded_at"
   end
 
@@ -55,7 +58,10 @@ ActiveRecord::Schema[8.0].define(version: 5) do
     t.datetime "discarded_at"
     t.datetime "created_at", null: false
     t.datetime "updated_at", null: false
+    t.string "confidence_level"
+    t.text "conflict_reasons"
     t.index ["company_id"], name: "index_vehicle_kms_on_company_id"
+    t.index ["confidence_level"], name: "index_vehicle_kms_on_confidence_level"
     t.index ["discarded_at"], name: "index_vehicle_kms_on_discarded_at"
     t.index ["source", "source_record_id"], name: "index_vehicle_kms_on_source_and_source_record_id"
     t.index ["status"], name: "index_vehicle_kms_on_status"

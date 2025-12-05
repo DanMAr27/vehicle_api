@@ -5,6 +5,5 @@ class AddConfidenceAndAdjustStatusToVehicleKms < ActiveRecord::Migration[7.0]
     add_column :vehicle_kms, :conflict_reasons, :text # JSON array de razones del conflicto
 
     add_index :vehicle_kms, :confidence_level
-    add_index :vehicle_kms, :status
   end
 end
