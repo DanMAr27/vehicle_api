@@ -39,10 +39,18 @@ module VehicleKms
     end
 
     def handle_maintenance_relation
-      # Si hay un mantenimiento asociado, desvincularlo
+      # Si hay un mantenimiento asociado, NO lo desvinculamos
+      # El mantenimiento mantiene la referencia al vehicle_km_id eliminado
+      # Esto permite rastrear que hubo un registro de KM y fue eliminado
       return unless @vehicle_km.maintenance
 
-      @vehicle_km.maintenance.update!(vehicle_km_id: nil)
+      # Registramos en las notas que el KM del mantenimiento fue eliminado
+      @vehicle_km.maintenance.paper_trail.save_with_version do
+        # PaperTrail registrará este cambio
+        @vehicle_km.maintenance.touch # Forzar actualización de updated_at
+      end
+
+      @maintenance_affected = @vehicle_km.maintenance
     end
 
     def recalculate_vehicle_km
@@ -57,7 +65,20 @@ module VehicleKms
     end
 
     def success
-      { success: true, vehicle_km: @vehicle_km }
+      result = {
+        success: true,
+        vehicle_km: @vehicle_km,
+        message: "Registro de KM eliminado correctamente"
+      }
+
+      if @maintenance_affected
+        result[:maintenance_affected] = {
+          id: @maintenance_affected.id,
+          warning: "Este KM estaba asociado a un mantenimiento. El mantenimiento mantiene la referencia pero el registro KM está eliminado."
+        }
+      end
+
+      result
     end
 
     def failure
