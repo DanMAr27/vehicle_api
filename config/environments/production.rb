@@ -17,7 +17,7 @@ Rails.application.configure do
   config.silence_healthcheck_path = "/up"
   config.active_support.report_deprecations = false
 
-  config.cache_store = :solid_cache_store
+  config.cache_store = :memory_store
   config.active_job.queue_adapter = :async
 
   config.i18n.fallbacks = true
