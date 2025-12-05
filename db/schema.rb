@@ -22,7 +22,7 @@ ActiveRecord::Schema[8.0].define(version: 7) do
     t.datetime "updated_at", null: false
     t.integer "max_daily_km_tolerance"
     t.boolean "auto_correction_enabled", default: true
-    t.integer "min_neighbors_for_correction", default: 1
+    t.integer "min_neighbors_for_correction", default: 5
     t.index ["discarded_at"], name: "index_companies_on_discarded_at"
   end
 
