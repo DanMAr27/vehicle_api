@@ -14,7 +14,7 @@ module VehicleKms
       next_record = find_next_record
 
       # Necesitamos al menos un vecino para validar magnitud
-      return { has_magnitude_issue: false } unless prev_record || next_record
+      return { has_magnitude_issue: false, can_interpolate: false } unless prev_record || next_record
 
       issues = []
 
@@ -30,11 +30,13 @@ module VehicleKms
         issues << next_issue if next_issue
       end
 
+      # CLAVE: puede interpolar si hay AMBOS vecinos (anterior Y posterior)
+      can_interpolate = prev_record.present? && next_record.present?
+
       {
         has_magnitude_issue: issues.any?,
         issues: issues,
-        severity: issues.any? ? "high" : nil,
-        can_interpolate: prev_record.present? && next_record.present?
+        can_interpolate: can_interpolate
       }
     end
 
@@ -80,7 +82,7 @@ module VehicleKms
         if deviation_percentage > MAX_DEVIATION_PERCENTAGE
           return {
             type: "extreme_magnitude_deviation",
-            message: "Incremento extremo detectado: #{actual_increase} km en #{days_diff} días (esperado: ~#{expected_increase.round} km, desviación: #{deviation_percentage.round}%)",
+            message: "Incremento extremo: #{actual_increase} km en #{days_diff} días (esperado: ~#{expected_increase.round} km, desviación: #{deviation_percentage.round}%)",
             expected: expected_increase.round,
             actual: actual_increase,
             deviation_percentage: deviation_percentage.round
@@ -103,7 +105,7 @@ module VehicleKms
       if percentage_diff > 20
         return {
           type: "extreme_future_deviation",
-          message: "KM significativamente superior al registro futuro: #{@vehicle_km.km_reported} vs #{next_record.effective_km} (diferencia: #{percentage_diff.round}%)",
+          message: "KM significativamente superior al futuro: #{@vehicle_km.km_reported} vs #{next_record.effective_km} (#{percentage_diff.round}% más alto)",
           percentage: percentage_diff.round
         }
       end
