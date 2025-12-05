@@ -1,6 +1,6 @@
 # app/api/v1/maintenances_api.rb
 module V1
-  class MaintenancesAPI < Grape::API
+  class MaintenancesApi < Grape::API
     resource :maintenances do
       desc "Lista mantenimientos"
       params do
