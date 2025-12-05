@@ -1,11 +1,10 @@
 # app/services/vehicle_kms/conflict_detector_service.rb
 #
-# Servicio para detectar si un registro de KM es conflictivo
-# basándose en una ventana local de registros vecinos
+# Servicio para detectar registros conflictivos en una ventana local
+# Evalúa TODOS los registros en la ventana, no solo el actual
 #
 module VehicleKms
   class ConflictDetectorService
-    # Tamaño de la ventana: cuántos registros mirar antes y después
     WINDOW_SIZE = 3
 
     def initialize(vehicle_km)
@@ -14,31 +13,29 @@ module VehicleKms
     end
 
     def call
-      # 1. Construir ventana local de registros vecinos
+      # 1. Construir ventana local
       window = build_window
 
-      # 2. Ordenar por fecha (y por ID si es misma fecha)
+      # 2. Ordenar por fecha e ID
       ordered_window = sort_window(window)
 
-      # 3. Encontrar la secuencia válida (ascendente)
+      # 3. Encontrar secuencia válida (ascendente más larga)
       valid_ids = find_valid_ascending_sequence(ordered_window)
 
-      # 4. Determinar si el registro actual es conflictivo
-      is_conflictive = !valid_ids.include?(@vehicle_km.id)
+      # 4. Clasificar TODOS los registros de la ventana
+      conflicts_by_id = classify_all_records(ordered_window, valid_ids)
 
-      # 5. Construir resultado detallado
       {
-        is_conflictive: is_conflictive,
+        current_is_conflictive: !valid_ids.include?(@vehicle_km.id),
         valid_sequence_ids: valid_ids,
-        window_records: ordered_window,
-        conflict_reasons: is_conflictive ? build_conflict_reasons : []
+        conflicts_by_id: conflicts_by_id,
+        window_records: ordered_window
       }
     end
 
     private
 
     def build_window
-      # Registros anteriores al actual
       previous_records = VehicleKm.kept
         .where(vehicle_id: @vehicle.id)
         .where("input_date < ? OR (input_date = ? AND id < ?)",
@@ -49,7 +46,6 @@ module VehicleKms
         .limit(WINDOW_SIZE)
         .to_a
 
-      # Registros posteriores al actual
       next_records = VehicleKm.kept
         .where(vehicle_id: @vehicle.id)
         .where("input_date > ? OR (input_date = ? AND id > ?)",
@@ -60,102 +56,90 @@ module VehicleKms
         .limit(WINDOW_SIZE)
         .to_a
 
-      # Combinar: anteriores + actual + posteriores
       (previous_records + [ @vehicle_km ] + next_records).uniq
     end
 
     def sort_window(window)
-      # Ordenar por fecha ascendente, y por ID si es misma fecha
       window.sort_by { |record| [ record.input_date, record.id ] }
     end
 
     def find_valid_ascending_sequence(ordered_records)
-      # Lógica clave: mantener la secuencia ascendente más larga
-      # Los registros que no encajan son conflictivos
+      # Algoritmo de subsecuencia creciente más larga (LIS - Longest Increasing Subsequence)
+      # pero adaptado para mantener coherencia temporal
 
-      valid_sequence = []
+      return [] if ordered_records.empty?
 
-      ordered_records.each do |record|
-        if valid_sequence.empty?
-          # Primer registro siempre se agrega
-          valid_sequence << record
-          next
-        end
+      # Usamos programación dinámica simple
+      n = ordered_records.size
+      dp = Array.new(n, 1)  # longitud de secuencia que termina en i
+      parent = Array.new(n, -1)  # para reconstruir la secuencia
 
-        last_valid = valid_sequence.last
-        current_km = record.km_reported
-        last_km = last_valid.km_reported
+      ordered_records.each_with_index do |current, i|
+        (0...i).each do |j|
+          prev = ordered_records[j]
 
-        if current_km >= last_km
-          # El KM sube o se mantiene: registro válido
-          valid_sequence << record
-        else
-          # El KM baja: hay un conflicto
-          # Decidir si mantenemos el último válido o lo reemplazamos
-
-          if should_replace_last_with_current?(valid_sequence, record)
-            # El registro actual encaja mejor en la secuencia
-            valid_sequence[-1] = record
+          # Solo consideramos si el KM es creciente
+          if current.km_reported >= prev.km_reported && dp[j] + 1 > dp[i]
+            dp[i] = dp[j] + 1
+            parent[i] = j
           end
-          # Si no se reemplaza, el registro actual queda fuera (conflictivo)
         end
       end
 
-      valid_sequence.map(&:id)
+      # Encontrar el índice con la secuencia más larga
+      max_length = dp.max
+      max_index = dp.index(max_length)
+
+      # Reconstruir la secuencia
+      sequence_indices = []
+      current_index = max_index
+
+      while current_index != -1
+        sequence_indices.unshift(current_index)
+        current_index = parent[current_index]
+      end
+
+      sequence_indices.map { |i| ordered_records[i].id }
     end
 
-    def should_replace_last_with_current?(valid_sequence, current_record)
-      # Si solo hay un registro en la secuencia válida, no reemplazamos
-      return false if valid_sequence.length < 2
+    def classify_all_records(ordered_window, valid_ids)
+      conflicts = {}
 
-      # Comparar con el penúltimo registro
-      penultimate = valid_sequence[-2]
-      penultimate_km = penultimate.km_reported
-      current_km = current_record.km_reported
+      ordered_window.each_with_index do |record, index|
+        is_valid = valid_ids.include?(record.id)
 
-      # El registro actual puede reemplazar al último si:
-      # 1. Es mayor o igual que el penúltimo (mantiene progresión)
-      # 2. Es menor que el último (por eso entramos aquí)
-      current_km >= penultimate_km
+        conflicts[record.id] = {
+          is_conflictive: !is_valid,
+          reasons: is_valid ? [] : build_conflict_reasons_for(record, index, ordered_window)
+        }
+      end
+
+      conflicts
     end
 
-    def build_conflict_reasons
+    def build_conflict_reasons_for(record, index, ordered_window)
       reasons = []
 
-      prev_record = find_immediate_previous
-      next_record = find_immediate_next
+      # Buscar registro anterior en la ventana
+      prev_record = index > 0 ? ordered_window[index - 1] : nil
 
-      if prev_record && @vehicle_km.km_reported < prev_record.km_reported
+      # Buscar registro posterior en la ventana
+      next_record = index < ordered_window.length - 1 ? ordered_window[index + 1] : nil
+
+      if prev_record && record.km_reported < prev_record.km_reported
         reasons << "KM inferior al registro anterior (#{prev_record.km_reported} km el #{prev_record.input_date.strftime('%d/%m/%Y')})"
       end
 
-      if next_record && @vehicle_km.km_reported > next_record.km_reported
+      if next_record && record.km_reported > next_record.km_reported
         reasons << "KM superior al registro posterior (#{next_record.km_reported} km el #{next_record.input_date.strftime('%d/%m/%Y')})"
       end
 
+      # Si no tiene razones específicas pero está fuera de la secuencia válida
+      if reasons.empty?
+        reasons << "Registro inconsistente con la secuencia general de kilometraje"
+      end
+
       reasons
-    end
-
-    def find_immediate_previous
-      VehicleKm.kept
-        .where(vehicle_id: @vehicle.id)
-        .where("input_date < ? OR (input_date = ? AND id < ?)",
-               @vehicle_km.input_date,
-               @vehicle_km.input_date,
-               @vehicle_km.id)
-        .order(input_date: :desc, id: :desc)
-        .first
-    end
-
-    def find_immediate_next
-      VehicleKm.kept
-        .where(vehicle_id: @vehicle.id)
-        .where("input_date > ? OR (input_date = ? AND id > ?)",
-               @vehicle_km.input_date,
-               @vehicle_km.input_date,
-               @vehicle_km.id)
-        .order(input_date: :asc, id: :asc)
-        .first
     end
   end
 end

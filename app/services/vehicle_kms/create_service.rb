@@ -1,8 +1,7 @@
 # ============================================================
 # app/services/vehicle_kms/create_service.rb
 #
-# Servicio simplificado para crear registros de KM
-# Solo detecta conflictos, sin intentar corregir aún
+# Servicio para crear registros de KM y revalidar ventana
 # ============================================================
 module VehicleKms
   class CreateService
@@ -20,7 +19,7 @@ module VehicleKms
 
       ActiveRecord::Base.transaction do
         create_km_record
-        detect_and_mark_conflicts
+        detect_and_mark_conflicts_in_window
         update_vehicle_current_km
         success
       end
@@ -49,28 +48,34 @@ module VehicleKms
       )
     end
 
-    def detect_and_mark_conflicts
-      # Usar el detector simple
+    def detect_and_mark_conflicts_in_window
+      # Ejecutar detector
       detector = ConflictDetectorService.new(@vehicle_km)
       result = detector.call
 
-      if result[:is_conflictive]
-        # Marcar como conflictivo
-        @vehicle_km.update!(
-          status: "conflictivo",
-          conflict_reasons_list: result[:conflict_reasons],
-          correction_notes: "Registro conflictivo detectado - requiere revisión"
-        )
-      else
-        # Mantener como original
-        @vehicle_km.update!(
-          status: "original",
-          conflict_reasons_list: []
-        )
-      end
+      # Actualizar TODOS los registros en la ventana según el resultado
+      result[:conflicts_by_id].each do |record_id, conflict_info|
+        record = result[:window_records].find { |r| r.id == record_id }
+        next unless record
 
-      # TODO: Revalidar registros vecinos en la ventana
-      # (implementar en siguiente iteración)
+        if conflict_info[:is_conflictive]
+          # Marcar como conflictivo
+          record.update!(
+            status: "conflictivo",
+            conflict_reasons_list: conflict_info[:reasons],
+            correction_notes: "Detectado como conflictivo en validación de ventana"
+          )
+        else
+          # Si estaba conflictivo y ahora es válido, restaurar
+          if record.status == "conflictivo"
+            record.update!(
+              status: "original",
+              conflict_reasons_list: [],
+              correction_notes: "Conflicto resuelto tras inserción de nuevo registro"
+            )
+          end
+        end
+      end
     end
 
     def update_vehicle_current_km
