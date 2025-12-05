@@ -26,7 +26,10 @@ module V1
       info: {
         title: "My Grape API V1",
         description: "Documentación básica de la API"
-      }
+      },
+        base_path: "/",
+        host: Rails.env.production? ? "vehicle-api-nwq1.onrender.com" : "localhost:3000",
+        schemes: Rails.env.production? ? [ "https" ] : [ "http" ]
     )
   end
 end
