@@ -1,31 +1,30 @@
 # app/models/vehicle_km.rb
 class VehicleKm < ApplicationRecord
-  include Discard::Model
-
   belongs_to :vehicle
   belongs_to :company
-  has_one :maintenance, dependent: :nullify
 
-  has_paper_trail
+  # Existing code...
 
-  SOURCES = %w[telemetria mantenimiento itv manual otro].freeze
-  STATUSES = %w[original estimado editado].freeze
+  VALID_STATUSES = %w[original estimado conflictivo].freeze
+  VALID_CONFIDENCE_LEVELS = %w[high medium low].freeze
 
-  validates :input_date, presence: true
-  validates :source, presence: true, inclusion: { in: SOURCES }
-  validates :km_reported, presence: true, numericality: { greater_than_or_equal_to: 0 }
-  validates :km_normalized, numericality: { greater_than_or_equal_to: 0, allow_nil: true }
-  validates :status, presence: true, inclusion: { in: STATUSES }
+  validates :status, inclusion: { in: VALID_STATUSES }
+  validates :confidence_level, inclusion: { in: VALID_CONFIDENCE_LEVELS }, allow_nil: true
 
-  scope :kept, -> { where(discarded_at: nil) }
-  scope :ordered, -> { order(input_date: :desc, created_at: :desc) }
-  scope :for_vehicle, ->(vehicle_id) { where(vehicle_id: vehicle_id) }
-  scope :original, -> { where(status: "original") }
-  scope :corrected, -> { where(status: %w[estimado editado]) }
-  scope :between_dates, ->(from, to) { where(input_date: from..to) }
-
-  # Obtener el KM efectivo (normalizado si existe, reportado si no)
+  # Método para obtener el KM efectivo
   def effective_km
-    km_normalized || km_reported
+    status == "original" ? km_reported : km_normalized
+  end
+
+  # Método para serializar razones de conflicto
+  def conflict_reasons_list
+    return [] if conflict_reasons.blank?
+    JSON.parse(conflict_reasons)
+  rescue JSON::ParserError
+    []
+  end
+
+  def conflict_reasons_list=(reasons)
+    self.conflict_reasons = reasons.to_json
   end
 end

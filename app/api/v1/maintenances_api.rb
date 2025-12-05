@@ -50,6 +50,7 @@ module V1
       post do
         vehicle = Vehicle.kept.find(params[:vehicle_id])
         vehicle_km = nil
+        km_warning = nil
 
         # Crear registro de KM automáticamente si se solicita
         if params[:create_km_record]
@@ -62,8 +63,20 @@ module V1
             }
           ).call
 
-          error!({ success: false, errors: km_result[:errors] }, 422) unless km_result[:success]
-          vehicle_km = km_result[:vehicle_km]
+          if km_result[:success]
+            vehicle_km = km_result[:vehicle_km]
+
+            # Advertir si quedó conflictivo
+            if km_result[:needs_review]
+              km_warning = "El registro de KM fue marcado como conflictivo y requiere revisión"
+            end
+          else
+            error!({
+              success: false,
+              errors: km_result[:errors],
+              context: "No se pudo crear el registro de KM"
+            }, 422)
+          end
         end
 
         # Crear mantenimiento
@@ -77,7 +90,15 @@ module V1
           description: params[:description]
         )
 
-        present maintenance, with: Entities::MaintenanceDetailEntity
+        response_data = {
+          success: true,
+          maintenance: present(maintenance, with: Entities::MaintenanceDetailEntity)
+        }
+
+        # Agregar advertencia si la hay
+        response_data[:warning] = km_warning if km_warning
+
+        response_data
       end
 
       desc "Actualizar un mantenimiento"
