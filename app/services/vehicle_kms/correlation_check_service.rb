@@ -1,4 +1,4 @@
-# app/services/vequeue_adapterhicle_kms/correlation_check_service.rb
+# app/services/vehicle_kms/correlation_check_service.rb
 module VehicleKms
   class CorrelationCheckService
     def initialize(vehicle_km)
@@ -13,11 +13,11 @@ module VehicleKms
       conflicts = []
 
       # Validación 1: Regresión (siempre se valida)
-      regression = check_regression(prev_record)
+      regression = check_regression(prev_record, next_record)
       conflicts << regression if regression
 
       # Validación 2: Inconsistencia futura (siempre se valida)
-      future_inconsistency = check_future_consistency(next_record)
+      future_inconsistency = check_future_consistency(prev_record, next_record)
       conflicts << future_inconsistency if future_inconsistency
 
       # Validación 3: Incremento irrealista (solo si está configurado)
@@ -39,27 +39,39 @@ module VehicleKms
     def find_previous_record
       VehicleKm.kept
               .where(vehicle_id: @vehicle_km.vehicle_id)
-              .where("input_date < ?", @vehicle_km.input_date)
-              .order(input_date: :desc)
+              .where("input_date < ? OR (input_date = ? AND id < ?)",
+                     @vehicle_km.input_date,
+                     @vehicle_km.input_date,
+                     @vehicle_km.id)
+              .order(input_date: :desc, id: :desc)
               .first
     end
 
     def find_next_record
       VehicleKm.kept
               .where(vehicle_id: @vehicle_km.vehicle_id)
-              .where("input_date > ?", @vehicle_km.input_date)
-              .order(input_date: :asc)
+              .where("input_date > ? OR (input_date = ? AND id > ?)",
+                     @vehicle_km.input_date,
+                     @vehicle_km.input_date,
+                     @vehicle_km.id)
+              .order(input_date: :asc, id: :asc)
               .first
     end
 
-    def check_regression(prev_record)
+    def check_regression(prev_record, next_record)
       return unless prev_record
       return unless @vehicle_km.km_reported < prev_record.effective_km
 
+      # CLAVE: La severidad depende de si podemos corregir, NO de la magnitud
+      # Si hay siguiente → podemos interpolar → MEDIUM (corregible)
+      # Si NO hay siguiente → solo extrapolación → HIGH (no confiable)
+      severity = next_record.present? ? "medium" : "high"
+
       {
         type: "regression",
-        message: "KM inferior al registro anterior (#{prev_record.effective_km} km en #{prev_record.input_date})",
-        severity: "high"
+        message: "KM inferior al registro anterior (#{prev_record.effective_km} km en #{prev_record.input_date.strftime('%d/%m/%Y')})",
+        severity: severity,
+        can_interpolate: next_record.present?
       }
     end
 
@@ -77,6 +89,7 @@ module VehicleKms
 
       return unless daily_avg > max_daily
 
+      # Incremento irrealista siempre es MEDIUM (es solo una advertencia)
       {
         type: "unrealistic_increase",
         message: "Incremento diario promedio muy alto: #{daily_avg.round(2)} km/día (máximo configurado: #{max_daily} km/día)",
@@ -84,24 +97,26 @@ module VehicleKms
       }
     end
 
-    def check_future_consistency(next_record)
+    def check_future_consistency(prev_record, next_record)
       return unless next_record
       return unless @vehicle_km.km_reported > next_record.effective_km
 
-      prev_record = find_previous_record
-
-      # Si NO existe registro anterior → NO se puede interpolar → HIGH
-      if prev_record.nil?
-        severity = "high"
-      else
-        # Sí existe anterior → se puede interpolar y corregir → MEDIUM
+      # CLAVE: La severidad depende de si podemos interpolar
+      # Si hay anterior Y posterior → podemos interpolar → MEDIUM (corregible)
+      # Si NO hay anterior → no podemos interpolar → HIGH (no corregible)
+      if prev_record.present?
         severity = "medium"
+        message = "KM superior al registro posterior (#{next_record.effective_km} km en #{next_record.input_date.strftime('%d/%m/%Y')}). Se puede corregir por interpolación."
+      else
+        severity = "high"
+        message = "KM superior al registro posterior (#{next_record.effective_km} km en #{next_record.input_date.strftime('%d/%m/%Y')}). No hay registro anterior para interpolar."
       end
 
       {
         type: "future_inconsistency",
-        message: "KM superior al registro posterior (#{next_record.effective_km} km en #{next_record.input_date})",
-        severity: severity
+        message: message,
+        severity: severity,
+        can_interpolate: prev_record.present?
       }
     end
   end
