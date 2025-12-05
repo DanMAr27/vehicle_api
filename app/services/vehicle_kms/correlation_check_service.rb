@@ -1,4 +1,4 @@
-# app/services/vehicle_kms/correlation_check_service.rb
+# app/services/vequeue_adapterhicle_kms/correlation_check_service.rb
 module VehicleKms
   class CorrelationCheckService
     def initialize(vehicle_km)
@@ -88,10 +88,20 @@ module VehicleKms
       return unless next_record
       return unless @vehicle_km.km_reported > next_record.effective_km
 
+      prev_record = find_previous_record
+
+      # Si NO existe registro anterior → NO se puede interpolar → HIGH
+      if prev_record.nil?
+        severity = "high"
+      else
+        # Sí existe anterior → se puede interpolar y corregir → MEDIUM
+        severity = "medium"
+      end
+
       {
         type: "future_inconsistency",
         message: "KM superior al registro posterior (#{next_record.effective_km} km en #{next_record.input_date})",
-        severity: "high"
+        severity: severity
       }
     end
   end
