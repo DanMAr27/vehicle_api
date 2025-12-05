@@ -1,6 +1,6 @@
 # app/api/v1/vehicle_kms_api.rb
 module V1
-  class VehicleKmsAPI < Grape::API
+  class VehicleKmsApi < Grape::API
     resource :vehicle_kms do
       desc "Lista registros de KM"
       params do
