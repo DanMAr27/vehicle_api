@@ -178,18 +178,17 @@ module VehicleKms
 
       # Encontrar el índice con la secuencia más larga
       max_length = dp.max
-      max_index = dp.index(max_length)
 
-      # Si hay múltiples secuencias de igual longitud,
-      # preferir la que incluye más registros históricos (no el nuevo)
-      # Esto evita marcar registros históricos como conflictivos si hay empate
-
+      # Si hay múltiples secuencias de igual longitud, usar criterio de desempate
       max_indices = dp.each_with_index.select { |len, _| len == max_length }.map(&:last)
 
       if max_indices.size > 1
-        # Preferir la secuencia que NO incluye el registro nuevo
-        preferred = max_indices.find { |idx| ordered_records[idx].id != @vehicle_km.id }
-        max_index = preferred if preferred
+        # CRITERIO DE DESEMPATE:
+        # Preferir la secuencia que minimiza "saltos" en fechas consecutivas
+        # Es decir, la que tiene más registros consecutivos por fecha
+        max_index = choose_best_sequence(max_indices, ordered_records, parent)
+      else
+        max_index = max_indices.first
       end
 
       # Reconstruir la secuencia desde max_index hacia atrás
@@ -203,6 +202,80 @@ module VehicleKms
 
       # Retornar los IDs de la secuencia válida
       sequence_indices.map { |idx| ordered_records[idx].id }
+    end
+
+    def choose_best_sequence(candidate_indices, ordered_records, parent)
+      # Para cada candidato, reconstruir su secuencia y calcular "calidad"
+      best_index = nil
+      best_score = -Float::INFINITY
+
+      candidate_indices.each do |end_index|
+        sequence = reconstruct_sequence(end_index, parent)
+        score = calculate_sequence_quality(sequence, ordered_records)
+
+        if score > best_score
+          best_score = score
+          best_index = end_index
+        end
+      end
+
+      best_index
+    end
+
+    def reconstruct_sequence(end_index, parent)
+      sequence = []
+      current = end_index
+
+      while current != -1
+        sequence.unshift(current)
+        current = parent[current]
+      end
+
+      sequence
+    end
+
+    def calculate_sequence_quality(sequence_indices, ordered_records)
+      # Criterios de calidad (en orden de importancia):
+      # 1. Si incluye el registro NUEVO (máxima prioridad - queremos validarlo si es posible)
+      # 2. Número de registros consecutivos por fecha (menos saltos = mejor)
+      # 3. Uniformidad de incrementos
+
+      score = 0
+
+      # Criterio 1: PRIORIDAD MÁXIMA - incluir el nuevo registro
+      # Si el nuevo registro puede formar parte de una secuencia válida, debe estarlo
+      includes_new = sequence_indices.any? { |idx| ordered_records[idx].id == @vehicle_km.id }
+      if includes_new
+        score += 100  # Peso muy alto
+      end
+
+      # Criterio 2: Penalizar saltos en fechas
+      date_gaps = 0
+      sequence_indices.each_cons(2) do |i, j|
+        # Contar cuántos registros saltamos entre i y j
+        skipped = j - i - 1
+        date_gaps += skipped
+      end
+
+      # Menos saltos = mejor
+      score += (date_gaps * -10)
+
+      # Criterio 3: Penalizar incrementos muy grandes (outliers históricos)
+      sequence_indices.each_cons(2) do |i, j|
+        km_diff = ordered_records[j].km_reported - ordered_records[i].km_reported
+        days_diff = (ordered_records[j].input_date - ordered_records[i].input_date).to_i
+
+        if days_diff > 0
+          daily_rate = km_diff.to_f / days_diff
+
+          # Penalizar incrementos > 300 km/día (probablemente errores)
+          if daily_rate > 300
+            score -= 3
+          end
+        end
+      end
+
+      score
     end
 
     def build_conflict_details(conflictive_ids, ordered_window)
