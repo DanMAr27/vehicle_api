@@ -1,0 +1,2237 @@
+# app/models/company.rb
+class Company < ApplicationRecord
+  include SoftDeletable
+  has_paper_trail
+
+  has_many :vehicles, dependent: :destroy
+  has_many :vehicle_kms, dependent: :destroy
+  has_many :maintenances, dependent: :destroy
+
+  validates :name, presence: true
+
+  scope :with_auto_correction, -> { where(auto_correction_enabled: true) }
+  scope :without_auto_correction, -> { where(auto_correction_enabled: false) }
+
+  # Relaciones que se borran automáticamente en cascada
+  # Company borra TODO: vehículos, KMs y mantenimientos
+  def soft_delete_cascade_relations
+    [
+      { name: :vehicles },
+      { name: :vehicle_kms },
+      { name: :maintenances }
+    ]
+  end
+
+  # Relaciones que IMPIDEN el borrado
+  # Company podría bloquearse por:
+  # - Facturas pendientes de cobro
+  # - Contratos vigentes
+  # - Usuarios activos vinculados
+  def soft_delete_blocking_relations
+    []
+
+    # Ejemplo futuro:
+    # [
+    #   {
+    #     name: :pending_invoices,
+    #     message: "facturas pendientes de cobro"
+    #   },
+    #   {
+    #     name: :active_contracts,
+    #     message: "contratos vigentes"
+    #   },
+    #   {
+    #     name: :active_users,
+    #     message: "usuarios activos vinculados"
+    #   }
+    # ]
+  end
+
+  # Relaciones que se desvinculan al borrar
+  # Company no nullifica nada (todo se borra en cascada)
+  def soft_delete_nullify_relations
+    []
+  end
+
+  # Validaciones personalizadas antes de borrar
+  def soft_delete_validations
+    warnings = []
+
+    # CONTEO TOTAL DE DATOS
+    total_vehicles = vehicles.kept.count
+    total_kms = vehicle_kms.kept.count
+    total_maintenances = maintenances.kept.count
+    total_records = total_vehicles + total_kms + total_maintenances
+
+    # ADVERTENCIA/BLOCKER según cantidad de datos
+    if total_records > 1000
+      # BLOCKER: Demasiados datos, usar job en segundo plano
+      warnings << {
+        severity: "blocker",
+        message: "BLOQUEADO: Esta compañía tiene #{total_records} registros. " \
+                 "No se puede eliminar de forma síncrona. " \
+                 "Use un job en segundo plano o contacte con el administrador."
+      }
+    elsif total_records > 500
+      # HIGH: Operación muy pesada
+      warnings << {
+        severity: "high",
+        message: "IMPORTANTE: Esta compañía tiene #{total_records} registros. " \
+                 "La operación puede tardar varios minutos y afectar el rendimiento del sistema. " \
+                 "#{total_vehicles} vehículos, #{total_kms} registros KM, #{total_maintenances} mantenimientos."
+      }
+    elsif total_records > 100
+      # WARNING: Operación pesada
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Esta compañía tiene #{total_records} registros. " \
+                 "#{total_vehicles} vehículos, #{total_kms} registros KM, #{total_maintenances} mantenimientos. " \
+                 "La operación puede tardar algunos minutos."
+      }
+    elsif total_records > 0
+      # INFO: Datos existentes
+      warnings << {
+        severity: "info",
+        message: "INFO: Se eliminarán #{total_vehicles} vehículos, " \
+                 "#{total_kms} registros KM y #{total_maintenances} mantenimientos."
+      }
+    end
+
+    # ADVERTENCIA: Vehículos con actividad reciente
+    recent_vehicles = vehicles.kept.joins(:vehicle_kms)
+      .where("vehicle_kms.input_date > ?", 30.days.ago)
+      .distinct
+      .count
+
+    if recent_vehicles > 0
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: #{recent_vehicles} vehículos tienen actividad reciente (últimos 30 días)."
+      }
+    end
+
+    # ADVERTENCIA: Datos antiguos con valor histórico
+    oldest_km_date = vehicle_kms.kept.minimum(:input_date)
+    if oldest_km_date && oldest_km_date < 5.years.ago
+      years = ((Date.today - oldest_km_date) / 365).to_i
+      warnings << {
+        severity: "info",
+        message: "INFO: Esta compañía tiene datos históricos de #{years} años. " \
+                 "Considere exportar antes de eliminar."
+      }
+    end
+
+    # ADVERTENCIA: KMs conflictivos sin resolver
+    conflictive_count = vehicle_kms.kept.conflictive.count
+    if conflictive_count > 0
+      warnings << {
+        severity: "info",
+        message: "INFO: Hay #{conflictive_count} registros de KM conflictivos sin resolver."
+      }
+    end
+
+    # Ejemplo futuro de BLOCKER:
+    # if has_pending_invoices?
+    #   warnings << {
+    #     severity: 'blocker',
+    #     message: "BLOQUEADO: No se puede eliminar porque tiene facturas pendientes de cobro."
+    #   }
+    # end
+
+    warnings
+  end
+
+  # Hook: guardar información antes de borrar
+  def before_soft_delete(context)
+    # Información básica de la compañía
+    context[:company_name] = name
+    context[:cif] = cif
+
+    # Conteo completo de datos
+    context[:vehicles_count] = vehicles.kept.count
+    context[:vehicle_kms_count] = vehicle_kms.kept.count
+    context[:maintenances_count] = maintenances.kept.count
+    context[:total_records] = context[:vehicles_count] +
+                              context[:vehicle_kms_count] +
+                              context[:maintenances_count]
+
+    # Estadísticas de vehículos
+    context[:vehicles_with_conflicts] = vehicles.kept.with_conflictive_kms.count
+
+    # Estadísticas de KMs
+    context[:conflictive_kms_count] = vehicle_kms.kept.conflictive.count
+    context[:corrected_kms_count] = vehicle_kms.kept.corrected.count
+    context[:manual_kms_count] = vehicle_kms.kept.manual.count
+
+    # Estadísticas de mantenimientos
+    context[:total_maintenance_cost] = maintenances.kept.sum(:amount).to_f
+    context[:maintenances_with_km] = maintenances.kept.with_km.count
+
+    # Datos históricos
+    context[:oldest_km_date] = vehicle_kms.kept.minimum(:input_date)
+    context[:newest_km_date] = vehicle_kms.kept.maximum(:input_date)
+    context[:oldest_maintenance_date] = maintenances.kept.minimum(:maintenance_date)
+    context[:newest_maintenance_date] = maintenances.kept.maximum(:maintenance_date)
+
+    # Configuración de la compañía (verificar si existen los campos)
+    context[:auto_correction_enabled] = respond_to?(:auto_correction_enabled) ? auto_correction_enabled : nil
+    context[:max_daily_km_tolerance] = respond_to?(:max_daily_km_tolerance) ? max_daily_km_tolerance : nil
+
+    # Usuario (inyectado por el coordinador)
+    user = instance_variable_get(:@deletion_user)
+    context[:performed_by] = user if user
+  end
+
+  # Hook: acciones después de borrar
+  def after_soft_delete(context)
+    # Log principal
+    Rails.logger.info(
+      "[SOFT DELETE] Company ##{id} eliminada: " \
+      "'#{context[:company_name]}' (CIF: #{context[:cif] || 'N/A'})"
+    )
+
+    # Log de impacto masivo
+    Rails.logger.info(
+      "[SOFT DELETE CASCADE] Eliminados en cascada: " \
+      "#{context[:vehicles_count]} vehículos, " \
+      "#{context[:vehicle_kms_count]} registros KM, " \
+      "#{context[:maintenances_count]} mantenimientos " \
+      "(#{context[:total_records]} total)"
+    )
+
+    # Log de estadísticas importantes
+    if context[:conflictive_kms_count] > 0 || context[:corrected_kms_count] > 0
+      Rails.logger.info(
+        "[SOFT DELETE INFO] KMs: " \
+        "#{context[:conflictive_kms_count]} conflictivos, " \
+        "#{context[:corrected_kms_count]} corregidos, " \
+        "#{context[:manual_kms_count]} manuales"
+      )
+    end
+
+    # Log de mantenimientos
+    if context[:total_maintenance_cost] > 0
+      Rails.logger.info(
+        "[SOFT DELETE INFO] Mantenimientos: " \
+        "#{context[:maintenances_count]} registros, " \
+        "costo total #{context[:total_maintenance_cost]}€"
+      )
+    end
+
+    # Log de datos históricos
+    if context[:oldest_km_date] && context[:newest_km_date]
+      years = ((context[:newest_km_date] - context[:oldest_km_date]) / 365).to_i
+      Rails.logger.info(
+        "[SOFT DELETE INFO] Rango histórico: " \
+        "#{context[:oldest_km_date].strftime('%d/%m/%Y')} - " \
+        "#{context[:newest_km_date].strftime('%d/%m/%Y')} " \
+        "(#{years} años de datos)"
+      )
+    end
+
+    # IMPORTANTE: Notificar a administradores si es una operación grande
+    if context[:total_records] > 100
+      Rails.logger.warn(
+        "[SOFT DELETE WARNING] Operación masiva: " \
+        "Se eliminaron #{context[:total_records]} registros de la compañía '#{context[:company_name]}'"
+      )
+
+      # Futuro: Enviar email a administradores
+      # AdminMailer.massive_company_deletion(self, context).deliver_later
+    end
+  end
+
+  # Validaciones antes de restaurar
+  def validate_soft_restore
+    errors = []
+
+    # Verificar conflicto de nombre con compañía activa
+    existing = Company.kept.where(name: name).where.not(id: id).first
+    if existing
+      errors << "Ya existe una compañía activa con el nombre '#{name}' (ID: #{existing.id}). " \
+                "Debe cambiar el nombre de la compañía existente o fusionar ambas compañías."
+    end
+
+    # Verificar conflicto de CIF si existe
+    if cif.present?
+      existing_cif = Company.kept.where(cif: cif).where.not(id: id).first
+      if existing_cif
+        errors << "Ya existe una compañía activa con el CIF '#{cif}' (ID: #{existing_cif.id}). " \
+                  "Debe cambiar el CIF de la compañía existente."
+      end
+    end
+
+    # Advertencia sobre datos huérfanos si hay mucho
+    discarded_vehicles = vehicles.discarded.count
+    if discarded_vehicles > 0
+      errors << "INFO: Esta compañía tiene #{discarded_vehicles} vehículos eliminados que no se restaurarán automáticamente. " \
+                "Considere restaurarlos también."
+    end
+
+    errors
+  end
+
+  # Campos únicos para verificación automática antes de restaurar
+  def uniqueness_validations
+    validations = [ { field: :name } ]
+    validations << { field: :cif } if cif.present?
+    validations
+  end
+
+  # Hook: acciones después de restaurar
+  def after_soft_restore(context)
+    # Usuario
+    user = instance_variable_get(:@restoration_user)
+    context[:performed_by] = user if user
+
+    # Información de cascadas
+    cascades_restored = instance_variable_get(:@cascades_restored)
+    context[:cascades_restored] = cascades_restored if cascades_restored
+
+    # Contar qué se restauró
+    if cascades_restored
+      context[:restored_vehicles_count] = vehicles.kept.count
+      context[:restored_kms_count] = vehicle_kms.kept.count
+      context[:restored_maintenances_count] = maintenances.kept.count
+      context[:total_restored] = context[:restored_vehicles_count] +
+                                 context[:restored_kms_count] +
+                                 context[:restored_maintenances_count]
+    end
+
+    # Log
+    Rails.logger.info(
+      "[RESTORE] Company ##{id} restaurada: '#{name}'" +
+      (cascades_restored ?
+        " (#{context[:restored_vehicles_count]} vehículos, " \
+        "#{context[:restored_kms_count]} KMs, " \
+        "#{context[:restored_maintenances_count]} mantenimientos restaurados)" :
+        "")
+    )
+
+    # Advertencia sobre operación masiva
+    if cascades_restored && context[:total_restored] > 100
+      Rails.logger.warn(
+        "[RESTORE WARNING] Operación masiva: " \
+        "Se restauraron #{context[:total_restored]} registros de la compañía '#{name}'"
+      )
+    end
+  end
+
+  # Verificar si la corrección automática está habilitada
+  def auto_correction_enabled?
+    auto_correction_enabled == true
+  end
+
+  # Obtener tolerancia de KM diarios (si existe)
+  def daily_km_tolerance
+    max_daily_km_tolerance || Float::INFINITY
+  end
+
+  # Verificar si un salto de KM excede la tolerancia
+  def exceeds_daily_tolerance?(km_diff, days_diff)
+    return false if max_daily_km_tolerance.nil?
+    return false if days_diff.zero?
+
+    daily_rate = km_diff.to_f / days_diff
+    daily_rate > max_daily_km_tolerance
+  end
+
+  # Estadísticas de KM de todos los vehículos
+  def km_stats
+    {
+      total_vehicles: vehicles.kept.count,
+      total_km_records: vehicle_kms.kept.count,
+      conflictive_records: vehicle_kms.kept.conflictive.count,
+      corrected_records: vehicle_kms.kept.corrected.count,
+      manual_records: vehicle_kms.kept.manual.count,
+      maintenance_records: vehicle_kms.kept.from_maintenance.count,
+      vehicles_with_conflicts: vehicles.kept.with_conflictive_kms.count,
+      by_status: vehicle_kms.kept.group(:status).count
+    }
+  end
+
+  # Resumen completo del impacto de borrar esta compañía
+  def deletion_impact_summary
+    coordinator = SoftDelete::DeletionCoordinator.new(self)
+    preview = coordinator.preview
+
+    total_vehicles = vehicles.kept.count
+    total_kms = vehicle_kms.kept.count
+    total_maintenances = maintenances.kept.count
+    total_records = total_vehicles + total_kms + total_maintenances
+
+    {
+      can_proceed: preview[:can_proceed],
+      requires_force: preview[:requires_force],
+      is_massive_operation: total_records > 100,
+      requires_background_job: total_records > 1000,
+      total_records_to_delete: total_records,
+      vehicles_count: total_vehicles,
+      vehicle_kms_count: total_kms,
+      maintenances_count: total_maintenances,
+      vehicles_with_conflicts: vehicles.kept.with_conflictive_kms.count,
+      conflictive_kms_count: vehicle_kms.kept.conflictive.count,
+      total_maintenance_cost: maintenances.kept.sum(:amount).to_f,
+      warnings_count: preview[:impact][:warnings].count,
+      estimated_time: preview[:impact][:estimated_time],
+      recommendation: preview[:message]
+    }
+  end
+
+  # Verifica si la restauración es viable
+  def restoration_viability
+    analyzer = SoftDelete::RestorationAnalyzer.new(self)
+    info = analyzer.analyze
+
+    total_cascaded = (info[:cascaded_records] || []).sum { |c| c[:count] }
+
+    {
+      can_restore: info[:can_restore],
+      conflicts: info[:conflicts],
+      cascaded_records_count: total_cascaded,
+      is_massive_restoration: total_cascaded > 100,
+      restore_options: info[:restore_options]&.map { |opt| opt[:type] },
+      recommendation: info[:recommendation]
+    }
+  end
+
+  # Exportar datos antes de eliminar (futuro)
+  def export_data_before_deletion
+    # TODO: Implementar exportación de datos
+    # Retornar archivo CSV/JSON con todos los datos
+    {
+      company: attributes,
+      vehicles: vehicles.kept.map(&:attributes),
+      vehicle_kms: vehicle_kms.kept.limit(1000).map(&:attributes), # Limitar para no explotar
+      maintenances: maintenances.kept.map(&:attributes),
+      exported_at: Time.current
+    }
+  end
+
+  # Descripción del estado para UI
+  def deletion_status_description
+    if kept?
+      active_vehicles = vehicles.kept.count
+      "Activa (#{active_vehicles} vehículos)"
+    else
+      deleted_at = discarded_at&.strftime("%d/%m/%Y %H:%M")
+      "Eliminada el #{deleted_at}"
+    end
+  end
+
+  # Nivel de riesgo de la operación de borrado
+  def deletion_risk_level
+    total = vehicles.kept.count + vehicle_kms.kept.count + maintenances.kept.count
+
+    case total
+    when 0..10
+      { level: :low, color: :green, description: "Bajo riesgo" }
+    when 11..100
+      { level: :medium, color: :yellow, description: "Riesgo medio" }
+    when 101..500
+      { level: :high, color: :orange, description: "Alto riesgo" }
+    else
+      { level: :critical, color: :red, description: "Riesgo crítico - Requiere job en segundo plano" }
+    end
+  end
+
+  private
+
+  # Métodos helper privados para futuras validaciones
+  # def has_pending_invoices?
+  #   invoices.pending.exists?
+  # end
+
+  # def has_active_contracts?
+  #   contracts.active.exists?
+  # end
+
+  # def has_active_users?
+  #   users.active.exists?
+  # end
+end
+# app/models/maintenance.rb
+class Maintenance < ApplicationRecord
+  include SoftDeletable
+  has_paper_trail
+
+  belongs_to :vehicle
+  belongs_to :company
+  belongs_to :vehicle_km, optional: true
+
+  validates :maintenance_date, presence: true
+  validates :register_km, presence: true, numericality: { greater_than_or_equal_to: 0 }
+  validates :amount, numericality: { greater_than_or_equal_to: 0, allow_nil: true }
+
+  scope :ordered, -> { order(maintenance_date: :desc) }
+  scope :with_km, -> { joins(:vehicle_km) }
+  scope :without_km, -> { left_joins(:vehicle_km).where(vehicle_kms: { id: nil }) }
+  scope :with_km_issues, -> {
+    left_joins(:vehicle_km)
+      .where("vehicle_kms.status = ? OR vehicle_kms.id IS NULL", "conflictivo")
+  }
+
+  # CONFIGURACIÓN DE SOFT DELETE
+  # Relaciones que se borran automáticamente en cascada
+  # Maintenance puede borrar opcionalmente su VehicleKm asociado
+  def soft_delete_cascade_relations
+    [
+      {
+        name: :vehicle_km,
+        optional: true,  # ← El usuario decide si borrar o mantener
+        condition: -> {
+          # Solo si:
+          # 1. Tiene VehicleKm asociado
+          # 2. El VehicleKm fue creado desde este mantenimiento
+          vehicle_km.present? && vehicle_km.from_maintenance?
+        }
+      }
+    ]
+  end
+
+  # Relaciones que IMPIDEN el borrado
+  # Maintenance no tiene bloqueos por ahora
+  # En el futuro podría bloquearse por:
+  # - Facturas asociadas pendientes de pago
+  # - Contratos de garantía vigentes
+  def soft_delete_blocking_relations
+    []
+
+    # Ejemplo futuro:
+    # [
+    #   {
+    #     name: :pending_invoices,
+    #     message: "facturas pendientes de pago"
+    #   }
+    # ]
+  end
+
+  # Relaciones que se desvinculan al borrar
+  # Maintenance no nullifica nada
+  def soft_delete_nullify_relations
+    []
+  end
+
+  # Validaciones personalizadas antes de borrar
+  def soft_delete_validations
+    warnings = []
+
+    # ADVERTENCIA: Tiene VehicleKm asociado
+    if vehicle_km.present?
+      km_info = vehicle_km.from_maintenance? ?
+                "creado desde este mantenimiento" :
+                "vinculado manualmente"
+
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este mantenimiento tiene un registro de KM asociado " \
+                 "(#{km_info}, ID: #{vehicle_km.id}). " \
+                 "Puede elegir borrar el KM en cascada o mantenerlo."
+      }
+    end
+
+    # ADVERTENCIA: Mantenimiento con costo alto
+    if amount.to_f > 1000
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este mantenimiento tiene un costo alto (#{amount}€)."
+      }
+    end
+
+    # ADVERTENCIA: Mantenimiento muy antiguo
+    if maintenance_date < 5.years.ago
+      warnings << {
+        severity: "info",
+        message: "INFO: Este mantenimiento es de hace más de 5 años (#{maintenance_date.strftime('%d/%m/%Y')})."
+      }
+    end
+
+    # ADVERTENCIA: Único mantenimiento del vehículo
+    if vehicle.maintenances.kept.count == 1
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este es el único mantenimiento registrado del vehículo #{vehicle.matricula}."
+      }
+    end
+
+    # Ejemplo futuro de BLOCKER:
+    # if has_pending_invoice?
+    #   warnings << {
+    #     severity: 'blocker',
+    #     message: "BLOQUEADO: No se puede eliminar porque tiene facturas pendientes de cobro."
+    #   }
+    # end
+
+    warnings
+  end
+
+  # Hook: guardar información antes de borrar
+  def before_soft_delete(context)
+    # Información del mantenimiento
+    context[:vehicle_matricula] = vehicle.matricula
+    context[:vehicle_id] = vehicle_id
+    context[:maintenance_date] = maintenance_date
+    context[:register_km] = register_km
+    context[:amount] = amount
+    context[:description] = description
+
+    # Información del VehicleKm
+    context[:has_vehicle_km] = vehicle_km.present?
+    context[:vehicle_km_id] = vehicle_km&.id
+    context[:vehicle_km_from_maintenance] = vehicle_km&.from_maintenance?
+
+    # Decisión del usuario sobre cascada opcional
+    cascade_decisions = instance_variable_get(:@cascade_decisions)
+    if cascade_decisions
+      context[:cascade_decision_vehicle_km] = cascade_decisions[:vehicle_km]
+    end
+
+    # Usuario (inyectado por el coordinador)
+    user = instance_variable_get(:@deletion_user)
+    context[:performed_by] = user if user
+  end
+
+  # Hook: acciones después de borrar
+  def after_soft_delete(context)
+    # Log detallado
+    Rails.logger.info(
+      "[SOFT DELETE] Maintenance ##{id} eliminado: " \
+      "Vehículo #{context[:vehicle_matricula]} (ID: #{context[:vehicle_id]}), " \
+      "Fecha #{context[:maintenance_date]}, " \
+      "KM #{context[:register_km]}, " \
+      "Importe #{context[:amount] || 'N/A'}€" +
+      (context[:has_vehicle_km] ? ", VehicleKm ID: #{context[:vehicle_km_id]}" : "")
+    )
+
+    # Log de decisión de cascada
+    if context[:has_vehicle_km]
+      decision = context[:cascade_decision_vehicle_km]
+      if decision == "delete"
+        Rails.logger.info(
+          "[SOFT DELETE CASCADE] VehicleKm ##{context[:vehicle_km_id]} será eliminado en cascada"
+        )
+      elsif decision == "keep"
+        Rails.logger.info(
+          "[SOFT DELETE] VehicleKm ##{context[:vehicle_km_id]} se mantiene (no borrado en cascada)"
+        )
+      end
+    end
+
+    # Aquí podrían agregarse notificaciones, emails, etc.
+    # Ejemplo futuro:
+    # MaintenanceMailer.deletion_notification(self, context).deliver_later
+  end
+
+  # Validaciones antes de restaurar
+  def validate_soft_restore
+    errors = []
+
+    # Verificar que el vehículo siga existiendo y esté activo
+    if vehicle.discarded?
+      errors << "El vehículo asociado (#{vehicle.matricula}, ID: #{vehicle_id}) fue eliminado. " \
+                "Debe restaurar primero el vehículo o reasignar este mantenimiento a otro vehículo."
+    end
+
+    # Verificar que la compañía siga existiendo y esté activa
+    if company.discarded?
+      errors << "La compañía asociada (#{company.name}, ID: #{company_id}) fue eliminada. " \
+                "Debe restaurar primero la compañía."
+    end
+
+    # Verificar VehicleKm si existe
+    if vehicle_km_id.present?
+      km = VehicleKm.with_discarded.find_by(id: vehicle_km_id)
+
+      if km.nil?
+        errors << "El registro de KM asociado (ID: #{vehicle_km_id}) fue eliminado permanentemente de la base de datos."
+      elsif km.discarded?
+        # No es error, solo informativo
+        # El coordinador puede ofrecer restaurar en cascada
+      end
+    end
+
+    errors
+  end
+
+  # Campos únicos para verificación automática antes de restaurar
+  # Maintenance NO tiene restricciones de unicidad
+  def uniqueness_validations
+    []
+  end
+
+  # Hook: acciones después de restaurar
+  def after_soft_restore(context)
+    # Usuario (inyectado por el coordinador)
+    user = instance_variable_get(:@restoration_user)
+    context[:performed_by] = user if user
+
+    # Información de cascadas
+    cascades_restored = instance_variable_get(:@cascades_restored)
+    context[:cascades_restored] = cascades_restored if cascades_restored
+
+    # Log
+    Rails.logger.info(
+      "[RESTORE] Maintenance ##{id} restaurado: " \
+      "Vehículo #{vehicle.matricula}, " \
+      "Fecha #{maintenance_date}, " \
+      "KM #{register_km}" +
+      (cascades_restored ? " (con cascadas restauradas)" : "")
+    )
+
+    # Si se restauró pero el VehicleKm sigue borrado, advertir
+    if vehicle_km_id.present?
+      km = VehicleKm.with_discarded.find_by(id: vehicle_km_id)
+      if km&.discarded?
+        Rails.logger.warn(
+          "[RESTORE WARNING] Maintenance ##{id} restaurado pero VehicleKm ##{vehicle_km_id} " \
+          "sigue borrado. Considere restaurar el KM también."
+        )
+      end
+    end
+  end
+
+  # MÉTODOS PÚBLICOS
+  # Estado del registro de KM asociado
+  def km_status
+    return "sin_registro" if vehicle_km.nil?
+    return "eliminado" if vehicle_km.discarded?
+    "activo"
+  end
+
+  # ¿El KM fue informado manualmente en el mantenimiento?
+  def km_manually_reported?
+    vehicle_km.present? && vehicle_km.from_maintenance?
+  end
+
+  # ¿El KM está desincronizado con el registro actual?
+  def km_desynchronized?
+    return false if vehicle_km.nil?
+    register_km != vehicle_km.effective_km
+  end
+
+  # Diferencia entre KM del mantenimiento y KM efectivo del registro
+  def km_difference
+    return 0 if vehicle_km.nil?
+    register_km - vehicle_km.effective_km
+  end
+
+  # ¿El KM está en conflicto?
+  def km_conflictive?
+    vehicle_km.present? && vehicle_km.needs_review?
+  end
+
+  # ¿El KM fue corregido automáticamente?
+  def km_auto_corrected?
+    vehicle_km.present? && vehicle_km.auto_corrected?
+  end
+
+  # MÉTODOS PÚBLICOS - UTILIDADES DE SOFT DELETE
+  # ¿Puede borrar su VehicleKm en cascada?
+  def can_delete_vehicle_km_cascade?
+    vehicle_km.present? && vehicle_km.from_maintenance?
+  end
+
+  # Descripción del estado del VehicleKm para mostrar al usuario
+  def vehicle_km_status_description
+    return "Sin registro de KM" if vehicle_km.nil?
+
+    if vehicle_km.discarded?
+      "KM eliminado (ID: #{vehicle_km.id})"
+    elsif vehicle_km.from_maintenance?
+      "KM creado desde este mantenimiento (ID: #{vehicle_km.id}, #{vehicle_km.status})"
+    else
+      "KM vinculado manualmente (ID: #{vehicle_km.id}, #{vehicle_km.status})"
+    end
+  end
+
+  # Impacto estimado de borrar este mantenimiento
+  # Wrapper conveniente sobre el coordinador
+  def deletion_impact_summary
+    coordinator = SoftDelete::DeletionCoordinator.new(self)
+    preview = coordinator.preview
+
+    {
+      can_proceed: preview[:can_proceed],
+      requires_force: preview[:requires_force],
+      has_optional_cascades: preview[:optional_cascades].any?,
+      optional_cascade_vehicle_km: can_delete_vehicle_km_cascade?,
+      warnings_count: preview[:impact][:warnings].count,
+      recommendation: preview[:message]
+    }
+  end
+
+  private
+
+  # Método helper privado para futuras validaciones
+  # def has_pending_invoice?
+  #   invoices.pending.exists?
+  # end
+end
+# app/models/soft_delete_audit_log.rb
+class SoftDeleteAuditLog < ApplicationRecord
+  # Registro que fue borrado/restaurado (polimórfico)
+  belongs_to :record, polymorphic: true
+
+  # Usuario que realizó la acción (polimórfico, opcional)
+  belongs_to :performed_by, polymorphic: true, optional: true
+
+  validates :action, presence: true, inclusion: { in: %w[delete restore] }
+  validates :performed_at, presence: true
+  validates :cascade_count, numericality: { greater_than_or_equal_to: 0 }
+  validates :nullify_count, numericality: { greater_than_or_equal_to: 0 }
+  validates :restore_complexity,
+            inclusion: { in: %w[simple medium complex] },
+            allow_nil: true
+
+  # Validar que el contexto sea un hash válido
+  before_validation :ensure_context_is_hash
+
+  scope :deletions, -> { where(action: "delete") }
+  scope :restorations, -> { where(action: "restore") }
+  scope :recent, -> { order(performed_at: :desc) }
+  scope :oldest, -> { order(performed_at: :asc) }
+  scope :for_record, ->(record) { where(record: record) }
+  scope :for_model, ->(model_class) { where(record_type: model_class.name) }
+  scope :by_user, ->(user) { where(performed_by: user) }
+  scope :restorable, -> { where(can_restore: true) }
+  scope :non_restorable, -> { where(can_restore: false) }
+  scope :simple_restores, -> { where(restore_complexity: "simple") }
+  scope :medium_restores, -> { where(restore_complexity: "medium") }
+  scope :complex_restores, -> { where(restore_complexity: "complex") }
+  scope :massive_operations, -> { where("cascade_count > ? OR nullify_count > ?", 10, 10) }
+  scope :with_cascades, -> { where("cascade_count > 0") }
+  scope :with_nullify, -> { where("nullify_count > 0") }
+  scope :between_dates, ->(from, to) { where(performed_at: from..to) }
+  scope :last_days, ->(days) { where("performed_at >= ?", days.days.ago) }
+
+  # MÉTODOS PÚBLICOS
+  # ¿Es una operación de borrado?
+  def deletion?
+    action == "delete"
+  end
+
+  # ¿Es una operación de restauración?
+  def restoration?
+    action == "restore"
+  end
+
+  # ¿Tuvo impacto en cascada?
+  def has_cascade_impact?
+    cascade_count > 0
+  end
+
+  # ¿Tuvo impacto en nullify?
+  def has_nullify_impact?
+    nullify_count > 0
+  end
+
+  # Impacto total (cascadas + nullify)
+  def total_impact
+    cascade_count + nullify_count
+  end
+
+  # ¿Es una operación masiva?
+  def massive_operation?
+    total_impact > 10
+  end
+
+  # Etiqueta de complejidad con color (para UI)
+  def complexity_badge
+    case restore_complexity
+    when "simple"
+      { label: "Simple", color: "green" }
+    when "medium"
+      { label: "Media", color: "yellow" }
+    when "complex"
+      { label: "Compleja", color: "red" }
+    else
+      { label: "Desconocida", color: "gray" }
+    end
+  end
+
+  # Descripción humana de la acción
+  def action_description
+    if deletion?
+      "Eliminó #{record_type} ##{record_id}"
+    else
+      "Restauró #{record_type} ##{record_id}"
+    end
+  end
+
+  # Descripción del impacto
+  def impact_description
+    parts = []
+    parts << "#{cascade_count} en cascada" if cascade_count > 0
+    parts << "#{nullify_count} desvinculados" if nullify_count > 0
+
+    return "Sin impacto adicional" if parts.empty?
+    parts.join(", ")
+  end
+
+  # Información del usuario que realizó la acción
+  def performed_by_description
+    return "Sistema automático" unless performed_by
+
+    "#{performed_by.class.name} ##{performed_by.id}"
+  end
+
+  # Obtener el registro original (si aún existe)
+  # Útil para restauraciones
+  def original_record
+    return nil unless record_type && record_id
+
+    record_type.constantize.with_discarded.find_by(id: record_id)
+  rescue NameError, ActiveRecord::RecordNotFound
+    nil
+  end
+
+  # ¿El registro original todavía existe en BD?
+  def record_exists?
+    original_record.present?
+  end
+
+  # ¿El registro está actualmente eliminado?
+  def record_discarded?
+    rec = original_record
+    rec.present? && rec.respond_to?(:discarded?) && rec.discarded?
+  end
+
+  # ¿El registro puede ser restaurado ahora?
+  def currently_restorable?
+    can_restore && record_exists? && record_discarded?
+  end
+
+  # Obtener el log de borrado correspondiente (desde una restauración)
+  # o el log de restauración (desde un borrado)
+  def paired_log
+    if deletion?
+      # Buscar la restauración posterior
+      self.class.restorations
+        .for_record(record)
+        .where("performed_at > ?", performed_at)
+        .order(performed_at: :asc)
+        .first
+    else
+      # Buscar el borrado anterior
+      self.class.deletions
+        .for_record(record)
+        .where("performed_at < ?", performed_at)
+        .order(performed_at: :desc)
+        .first
+    end
+  end
+
+  # MÉTODOS DE CLASE - ESTADÍSTICAS
+  class << self
+    # Estadísticas generales de borrados
+    def deletion_stats
+      {
+        total_deletions: deletions.count,
+        total_restorations: restorations.count,
+        by_model: deletions.group(:record_type).count,
+        by_complexity: deletions.group(:restore_complexity).count,
+        cascade_impact: deletions.sum(:cascade_count),
+        nullify_impact: deletions.sum(:nullify_count),
+        massive_operations: massive_operations.count,
+        restorable_count: deletions.restorable.count
+      }
+    end
+
+    # Estadísticas por modelo específico
+    def stats_for_model(model_class)
+      logs = for_model(model_class)
+
+      {
+        model: model_class.name,
+        total_deletions: logs.deletions.count,
+        total_restorations: logs.restorations.count,
+        average_cascade: logs.deletions.average(:cascade_count).to_f.round(2),
+        average_nullify: logs.deletions.average(:nullify_count).to_f.round(2),
+        by_complexity: logs.deletions.group(:restore_complexity).count
+      }
+    end
+
+    # Estadísticas por usuario
+    def stats_for_user(user)
+      logs = by_user(user)
+
+      {
+        user: user,
+        total_deletions: logs.deletions.count,
+        total_restorations: logs.restorations.count,
+        models_affected: logs.select(:record_type).distinct.count,
+        total_cascade_impact: logs.sum(:cascade_count),
+        massive_operations: logs.massive_operations.count,
+        first_action: logs.minimum(:performed_at),
+        last_action: logs.maximum(:performed_at)
+      }
+    end
+
+    # Top modelos más borrados
+    def top_deleted_models(limit = 10)
+      deletions
+        .group(:record_type)
+        .order("COUNT(*) DESC")
+        .limit(limit)
+        .count
+        .map do |model, count|
+          {
+            model: model,
+            deletion_count: count,
+            restoration_count: restorations.for_model(model.constantize).count
+          }
+        end
+    end
+
+    # Operaciones recientes con impacto alto
+    def recent_high_impact(days = 7, min_impact = 10)
+      last_days(days)
+        .where("cascade_count + nullify_count >= ?", min_impact)
+        .order(performed_at: :desc)
+    end
+
+    # Registros pendientes de restauración
+    def pending_restorations
+      deletion_ids = deletions.pluck(:record_type, :record_id)
+      restoration_ids = restorations.pluck(:record_type, :record_id)
+
+      pending = deletion_ids - restoration_ids
+
+      where(
+        record_type: pending.map(&:first),
+        record_id: pending.map(&:last)
+      ).deletions.restorable
+    end
+  end
+
+  private
+
+  def ensure_context_is_hash
+    self.context = {} unless context.is_a?(Hash)
+  end
+end
+# app/models/vehicle_km.rb
+class VehicleKm < ApplicationRecord
+  include SoftDeletable  # ← NUEVO: Incluye funcionalidad de soft delete
+  has_paper_trail
+
+  belongs_to :vehicle
+  belongs_to :company
+  belongs_to :source_record, polymorphic: true, optional: true
+
+  VALID_STATUSES = %w[original corregido editado conflictivo].freeze
+
+  validates :status, inclusion: { in: VALID_STATUSES }
+  validates :input_date, presence: true
+  validates :km_reported, presence: true, numericality: { greater_than_or_equal_to: 0 }
+  validates :km_normalized, numericality: { greater_than_or_equal_to: 0, allow_nil: true }
+  validates :source_record_type, presence: true, if: -> { source_record_id.present? }
+  validates :source_record_id, presence: true, if: -> { source_record_type.present? }
+
+  scope :ordered, -> { order(input_date: :desc, created_at: :desc) }
+  scope :by_status, ->(status) { where(status: status) }
+  scope :conflictive, -> { where(status: "conflictivo") }
+  scope :needs_review, -> { conflictive }
+  scope :corrected, -> { where(status: "corregido") }
+  scope :original, -> { where(status: "original") }
+  scope :by_vehicle, ->(vehicle_id) { where(vehicle_id: vehicle_id) }
+  scope :by_source_type, ->(type) { where(source_record_type: type) }
+  scope :from_maintenance, -> { where(source_record_type: "Maintenance") }
+  scope :manual, -> { where(source_record_type: nil) }
+  scope :in_date_range, ->(from, to) { where(input_date: from..to) }
+
+  after_commit :update_vehicle_stats, on: [ :create, :update, :destroy ]
+
+  # CONFIGURACIÓN DE SOFT DELETE
+  # Relaciones que se borran automáticamente en cascada
+  # VehicleKm NO borra nada en cascada (es un registro hoja)
+  def soft_delete_cascade_relations
+    []
+  end
+
+  # Relaciones que IMPIDEN el borrado
+  # VehicleKm NUNCA bloquea el borrado (siempre se puede borrar)
+  def soft_delete_blocking_relations
+    []
+  end
+
+  # Relaciones que se desvinculan al borrar este VehicleKm
+  # Los Maintenances que apuntan a este VehicleKm quedarán sin referencia
+  def soft_delete_nullify_relations
+    [
+      {
+        name: :referencing_maintenances,
+        model: "Maintenance",
+        foreign_key: "vehicle_km_id",
+        notify: true
+      }
+    ]
+  end
+
+  # Validaciones personalizadas antes de borrar
+  # Genera advertencias según el contexto del registro
+  def soft_delete_validations
+    warnings = []
+
+    # ADVERTENCIA: KM creado desde un mantenimiento
+    if from_maintenance? && maintenance.present?
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este KM fue creado desde el mantenimiento ##{maintenance.id} " \
+                 "(#{maintenance.maintenance_date.strftime('%d/%m/%Y')}). " \
+                 "El mantenimiento quedará desvinculado."
+      }
+    end
+
+    # ADVERTENCIA: KM con correcciones automáticas
+    if status == "corregido"
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este KM tiene correcciones automáticas " \
+                 "(KM reportado: #{km_reported}, corregido: #{km_normalized}). " \
+                 "Se perderá el historial de corrección."
+      }
+    end
+
+    # ADVERTENCIA: Único registro del vehículo
+    if vehicle.vehicle_kms.kept.count == 1
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este es el único registro de KM del vehículo #{vehicle.matricula}. " \
+                 "El vehículo quedará sin historial de kilómetros."
+      }
+    end
+
+    # ADVERTENCIA: KM conflictivo sin resolver
+    if status == "conflictivo"
+      reasons = conflict_reasons_list.join("; ")
+      warnings << {
+        severity: "info",
+        message: "INFO: Este KM está marcado como conflictivo. Razones: #{reasons}"
+      }
+    end
+
+    warnings
+  end
+
+  # Hook: guardar información antes de borrar
+  def before_soft_delete(context)
+    # Guardar información del registro para auditoría
+    context[:vehicle_matricula] = vehicle.matricula
+    context[:vehicle_id] = vehicle_id
+    context[:input_date] = input_date
+    context[:km_reported] = km_reported
+    context[:km_normalized] = km_normalized
+    context[:status] = status
+    context[:from_maintenance] = from_maintenance?
+    context[:maintenance_id] = maintenance&.id
+    context[:has_corrections] = (status == "corregido")
+    context[:is_conflictive] = (status == "conflictivo")
+
+    # Agregar usuario si está disponible (inyectado por el coordinador)
+    user = instance_variable_get(:@deletion_user)
+    context[:performed_by] = user if user
+  end
+
+  # Hook: acciones después de borrar
+  def after_soft_delete(context)
+    # Recalcular ventana de KMs vecinos
+    # Esto puede marcar otros KMs como válidos o conflictivos
+    revalidate_km_window_after_deletion
+
+    # Recalcular el current_km del vehículo
+    update_vehicle_current_km
+
+    # Log detallado
+    Rails.logger.info(
+      "[SOFT DELETE] VehicleKm ##{id} eliminado: " \
+      "Vehículo #{context[:vehicle_matricula]} (ID: #{context[:vehicle_id]}), " \
+      "Fecha #{context[:input_date]}, " \
+      "KM reportado #{context[:km_reported]}, " \
+      "Estado #{context[:status]}" +
+      (context[:from_maintenance] ? ", Desde mantenimiento ##{context[:maintenance_id]}" : "")
+    )
+
+    # Si estaba vinculado a un mantenimiento, notificar
+    if context[:from_maintenance] && context[:maintenance_id]
+      Rails.logger.info(
+        "[SOFT DELETE IMPACT] Mantenimiento ##{context[:maintenance_id]} quedó sin KM asociado"
+      )
+    end
+  end
+
+  # Validaciones antes de restaurar
+  def validate_soft_restore
+    errors = []
+
+    # Verificar que el vehículo siga existiendo y esté activo
+    if vehicle.discarded?
+      errors << "El vehículo asociado (#{vehicle.matricula}, ID: #{vehicle_id}) fue eliminado. " \
+                "Debe restaurar primero el vehículo o reasignar este KM a otro vehículo activo."
+    end
+
+    # Verificar que la compañía siga existiendo y esté activa
+    if company.discarded?
+      errors << "La compañía asociada (#{company.name}, ID: #{company_id}) fue eliminada. " \
+                "Debe restaurar primero la compañía."
+    end
+
+    errors
+  end
+
+  # Campos únicos para verificación automática antes de restaurar
+  # VehicleKm NO tiene restricciones de unicidad
+  # (puede haber múltiples registros del mismo vehículo en la misma fecha)
+  def uniqueness_validations
+    []
+  end
+
+  # Hook: acciones después de restaurar
+  def after_soft_restore(context)
+    # Recalcular ventana de KMs vecinos
+    # Esto puede afectar el estado de otros KMs
+    revalidate_km_window_after_restoration
+
+    # Recalcular el current_km del vehículo
+    update_vehicle_current_km
+
+    # Agregar usuario si está disponible
+    user = instance_variable_get(:@restoration_user)
+    context[:performed_by] = user if user
+
+    # Log
+    Rails.logger.info(
+      "[RESTORE] VehicleKm ##{id} restaurado: " \
+      "Vehículo #{vehicle.matricula}, " \
+      "Fecha #{input_date}, " \
+      "KM #{km_reported}"
+    )
+  end
+
+  def effective_km
+    km_normalized || km_reported
+  end
+
+  def conflict_reasons_list
+    return [] if conflict_reasons.blank?
+    JSON.parse(conflict_reasons)
+  rescue JSON::ParserError
+    []
+  end
+
+  def conflict_reasons_list=(reasons)
+    self.conflict_reasons = reasons.to_json
+  end
+
+  # Método mejorado para obtener el mantenimiento asociado
+  def maintenance
+    return nil unless from_maintenance?
+    return @maintenance if defined?(@maintenance)
+
+    @maintenance = Maintenance.kept.find_by(vehicle_km_id: id)
+    @maintenance ||= source_record if source_record.is_a?(Maintenance)
+    @maintenance
+  end
+
+  def source_maintenance
+    source_record if source_record_type == "Maintenance"
+  end
+
+  def from_maintenance?
+    source_record_type == "Maintenance"
+  end
+
+  def manually_created?
+    source_record.nil?
+  end
+
+  def needs_review?
+    status == "conflictivo"
+  end
+
+  def auto_corrected?
+    status == "corregido"
+  end
+
+  def manually_edited?
+    status == "editado"
+  end
+
+  def correction_difference
+    return 0 if km_normalized.nil?
+    km_normalized - km_reported
+  end
+
+  def correction_percentage
+    return 0 if km_reported.zero? || km_normalized.nil?
+    ((correction_difference.to_f / km_reported) * 100).round(2)
+  end
+
+  def source_description
+    if manually_created?
+      "Manual"
+    elsif from_maintenance?
+      maint = maintenance
+      if maint
+        "Mantenimiento ##{maint.id} (#{maint.maintenance_date.strftime('%d/%m/%Y')})"
+      else
+        "Mantenimiento ##{source_record_id} (registro eliminado)"
+      end
+    else
+      "Desconocido"
+    end
+  end
+
+  def maintenance_exists?
+    from_maintenance? && maintenance.present?
+  end
+
+  def maintenance_deleted?
+    from_maintenance? && maintenance.nil?
+  end
+
+  private
+
+  # Recalcula y corrige la ventana de KMs vecinos después de borrar
+  def revalidate_km_window_after_deletion
+    window = build_window_around_deleted
+
+    window.each do |record|
+      detector = VehicleKms::ConflictDetectorService.new(record)
+      result = detector.call
+
+      if result[:has_conflict]
+        # Procesar registros conflictivos
+        result[:conflictive_records].each do |conflict_info|
+          rec = VehicleKm.find(conflict_info[:record_id])
+
+          corrector = VehicleKms::KmCorrectionService.new(rec)
+          correction_result = corrector.call
+
+          if correction_result[:success]
+            rec.update!(
+              km_normalized: correction_result[:corrected_km],
+              status: "corregido",
+              conflict_reasons_list: conflict_info[:reasons],
+              correction_notes: correction_result[:notes]
+            )
+          else
+            rec.update!(
+              km_normalized: rec.km_reported,
+              status: "conflictivo",
+              conflict_reasons_list: conflict_info[:reasons],
+              correction_notes: correction_result[:notes]
+            )
+          end
+        end
+
+        # Restaurar registros que ahora son válidos
+        result[:valid_records].each do |valid_id|
+          rec = VehicleKm.find(valid_id)
+          if %w[conflictivo corregido].include?(rec.status)
+            rec.update!(
+              km_normalized: rec.km_reported,
+              status: "original",
+              conflict_reasons_list: [],
+              correction_notes: "Restaurado a secuencia válida tras eliminación de registro"
+            )
+          end
+        end
+      end
+    end
+  rescue StandardError => e
+    Rails.logger.error(
+      "[REVALIDATION ERROR] Error revalidating KM window after deletion: #{e.message}"
+    )
+  end
+
+  # Recalcula la ventana de KMs después de restaurar
+  def revalidate_km_window_after_restoration
+    detector = VehicleKms::ConflictDetectorService.new(self)
+    result = detector.call
+
+    if result[:has_conflict]
+      result[:conflictive_records].each do |conflict_info|
+        record = VehicleKm.find(conflict_info[:record_id])
+
+        corrector = VehicleKms::KmCorrectionService.new(record)
+        correction_result = corrector.call
+
+        if correction_result[:success]
+          record.update!(
+            km_normalized: correction_result[:corrected_km],
+            status: "corregido",
+            conflict_reasons_list: conflict_info[:reasons],
+            correction_notes: correction_result[:notes]
+          )
+        else
+          record.update!(
+            km_normalized: record.km_reported,
+            status: "conflictivo",
+            conflict_reasons_list: conflict_info[:reasons],
+            correction_notes: correction_result[:notes]
+          )
+        end
+      end
+
+      result[:valid_records].each do |valid_id|
+        record = VehicleKm.find(valid_id)
+        next if record.id == id
+
+        if %w[conflictivo corregido].include?(record.status)
+          record.update!(
+            km_normalized: record.km_reported,
+            status: "original",
+            conflict_reasons_list: [],
+            correction_notes: "Restaurado tras restauración de registro vecino"
+          )
+        end
+      end
+    end
+  rescue StandardError => e
+    Rails.logger.error(
+      "[REVALIDATION ERROR] Error revalidating KM window after restoration: #{e.message}"
+    )
+  end
+
+  # Construye ventana de registros vecinos
+  def build_window_around_deleted
+    previous_records = VehicleKm.kept
+      .where(vehicle_id: vehicle_id)
+      .where("input_date < ? OR (input_date = ? AND id < ?)",
+             input_date, input_date, id)
+      .order(input_date: :desc, id: :desc)
+      .limit(5)
+      .to_a
+
+    next_records = VehicleKm.kept
+      .where(vehicle_id: vehicle_id)
+      .where("input_date > ? OR (input_date = ? AND id > ?)",
+             input_date, input_date, id)
+      .order(input_date: :asc, id: :asc)
+      .limit(5)
+      .to_a
+
+    (previous_records + next_records).uniq
+  end
+
+  # Actualiza el current_km del vehículo
+  def update_vehicle_current_km
+    latest = VehicleKm.kept
+      .where(vehicle_id: vehicle_id)
+      .order(input_date: :desc, created_at: :desc)
+      .first
+
+    new_km = latest ? latest.effective_km : 0
+    vehicle.update!(current_km: new_km)
+  rescue StandardError => e
+    Rails.logger.error(
+      "[UPDATE VEHICLE KM ERROR] Error updating vehicle current_km: #{e.message}"
+    )
+  end
+
+  def update_vehicle_stats
+    return unless vehicle.respond_to?(:total_km_records)
+
+    vehicle.update_columns(
+      total_km_records: vehicle.vehicle_kms.kept.count,
+      conflictive_km_records: vehicle.vehicle_kms.kept.conflictive.count,
+      last_km_update_at: Time.current
+    )
+  rescue StandardError => e
+    Rails.logger.error(
+      "[UPDATE STATS ERROR] Error updating vehicle stats: #{e.message}"
+    )
+  end
+end
+# app/models/vehicle.rb
+class Vehicle < ApplicationRecord
+  include SoftDeletable
+  has_paper_trail
+
+  belongs_to :company
+  has_many :vehicle_kms, dependent: :destroy
+  has_many :maintenances, dependent: :destroy
+
+  validates :matricula, presence: true, uniqueness: { scope: :company_id }
+  validates :current_km, numericality: { greater_than_or_equal_to: 0 }
+
+  scope :with_conflictive_kms, -> {
+    joins(:vehicle_kms)
+      .where(vehicle_kms: { status: "conflictivo", discarded_at: nil })
+      .distinct
+  }
+  scope :ordered, -> { order(matricula: :asc) }
+
+  # CONFIGURACIÓN DE SOFT DELETE
+  # Relaciones que se borran automáticamente en cascada
+  # Vehicle borra TODOS sus registros relacionados
+  def soft_delete_cascade_relations
+    [
+      { name: :vehicle_kms },
+      { name: :maintenances }
+    ]
+  end
+
+  # Relaciones que IMPIDEN el borrado
+  # Vehicle no tiene bloqueos por ahora
+  # En el futuro podría bloquearse por:
+  # - Contratos de leasing activos
+  # - Documentación legal pendiente
+  # - Vehículo asignado a conductor activo
+  def soft_delete_blocking_relations
+    []
+
+    # Ejemplo futuro:
+    # [
+    #   {
+    #     name: :active_leasing_contracts,
+    #     message: "contratos de leasing activos"
+    #   },
+    #   {
+    #     name: :active_driver_assignments,
+    #     message: "asignaciones a conductores activos"
+    #   }
+    # ]
+  end
+
+  # Relaciones que se desvinculan al borrar
+  # Vehicle no nullifica nada (todo se borra en cascada)
+  def soft_delete_nullify_relations
+    []
+  end
+
+  # Validaciones personalizadas antes de borrar
+  def soft_delete_validations
+    warnings = []
+
+    # ADVERTENCIA: Cantidad de registros a borrar
+    total_kms = vehicle_kms.kept.count
+    total_maintenances = maintenances.kept.count
+    total_records = total_kms + total_maintenances
+
+    if total_records > 0
+      parts = []
+      parts << "#{total_kms} registros de KM" if total_kms > 0
+      parts << "#{total_maintenances} mantenimientos" if total_maintenances > 0
+
+      severity = if total_records > 100
+                   "high"
+      elsif total_records > 20
+                   "warning"
+      else
+                   "info"
+      end
+
+      warnings << {
+        severity: severity,
+        message: "#{severity == 'high' ? 'IMPORTANTE' : 'ADVERTENCIA'}: " \
+                 "Se eliminarán #{parts.join(' y ')} (#{total_records} registros en total)."
+      }
+    end
+
+    # ADVERTENCIA: Vehículo con KMs conflictivos sin resolver
+    conflictive_count = vehicle_kms.kept.conflictive.count
+    if conflictive_count > 0
+      warnings << {
+        severity: "info",
+        message: "INFO: Este vehículo tiene #{conflictive_count} registros de KM conflictivos sin resolver."
+      }
+    end
+
+    # ADVERTENCIA: Vehículo con datos recientes
+    recent_km = vehicle_kms.kept.where("input_date > ?", 30.days.ago).count
+    recent_maintenance = maintenances.kept.where("maintenance_date > ?", 30.days.ago).count
+
+    if recent_km > 0 || recent_maintenance > 0
+      warnings << {
+        severity: "warning",
+        message: "ADVERTENCIA: Este vehículo tiene actividad reciente " \
+                 "(últimos 30 días: #{recent_km} KMs, #{recent_maintenance} mantenimientos)."
+      }
+    end
+
+    # ADVERTENCIA: Vehículo con kilometraje alto
+    if current_km > 200000
+      warnings << {
+        severity: "info",
+        message: "INFO: Este vehículo tiene un kilometraje alto (#{current_km} km). " \
+                 "Podría tener valor histórico."
+      }
+    end
+
+    # Ejemplo futuro de BLOCKER:
+    # if has_active_leasing?
+    #   warnings << {
+    #     severity: 'blocker',
+    #     message: "BLOQUEADO: No se puede eliminar porque tiene un contrato de leasing activo."
+    #   }
+    # end
+
+    warnings
+  end
+
+  # Hook: guardar información antes de borrar
+  def before_soft_delete(context)
+    # Información básica del vehículo
+    context[:matricula] = matricula
+    context[:vin] = vin
+    context[:current_km] = current_km
+    context[:company_name] = company.name
+    context[:company_id] = company_id
+
+    # Contar registros a eliminar (para auditoría)
+    context[:vehicle_kms_count] = vehicle_kms.kept.count
+    context[:maintenances_count] = maintenances.kept.count
+    context[:total_records] = context[:vehicle_kms_count] + context[:maintenances_count]
+
+    # Estadísticas de KMs
+    context[:conflictive_kms_count] = vehicle_kms.kept.conflictive.count
+    context[:last_km_date] = vehicle_kms.kept.maximum(:input_date)
+    context[:last_maintenance_date] = maintenances.kept.maximum(:maintenance_date)
+
+    # Usuario (inyectado por el coordinador)
+    user = instance_variable_get(:@deletion_user)
+    context[:performed_by] = user if user
+  end
+
+  # Hook: acciones después de borrar
+  def after_soft_delete(context)
+    # Log detallado
+    Rails.logger.info(
+      "[SOFT DELETE] Vehicle ##{id} eliminado: " \
+      "Matrícula #{context[:matricula]}, " \
+      "VIN #{context[:vin] || 'N/A'}, " \
+      "KM actual #{context[:current_km]}, " \
+      "Compañía #{context[:company_name]} (ID: #{context[:company_id]})"
+    )
+
+    # Log de impacto en cascada
+    Rails.logger.info(
+      "[SOFT DELETE CASCADE] Eliminados en cascada: " \
+      "#{context[:vehicle_kms_count]} registros KM, " \
+      "#{context[:maintenances_count]} mantenimientos " \
+      "(#{context[:total_records]} total)"
+    )
+
+    # Log de KMs conflictivos si los había
+    if context[:conflictive_kms_count] > 0
+      Rails.logger.info(
+        "[SOFT DELETE INFO] Se eliminaron #{context[:conflictive_kms_count]} KMs conflictivos sin resolver"
+      )
+    end
+
+    # Log de última actividad
+    if context[:last_km_date] || context[:last_maintenance_date]
+      Rails.logger.info(
+        "[SOFT DELETE INFO] Última actividad: " \
+        "KM #{context[:last_km_date]&.strftime('%d/%m/%Y') || 'N/A'}, " \
+        "Mantenimiento #{context[:last_maintenance_date]&.strftime('%d/%m/%Y') || 'N/A'}"
+      )
+    end
+
+    # Aquí podrían agregarse notificaciones importantes
+    # Ejemplo futuro:
+    # if context[:total_records] > 100
+    #   AdminMailer.massive_vehicle_deletion(self, context).deliver_later
+    # end
+  end
+
+  # Validaciones antes de restaurar
+  def validate_soft_restore
+    errors = []
+
+    # Verificar que la compañía siga existiendo y esté activa
+    if company.discarded?
+      errors << "La compañía asociada (#{company.name}, ID: #{company_id}) fue eliminada. " \
+                "Debe restaurar primero la compañía o reasignar este vehículo a otra compañía."
+    end
+
+    # Verificar conflicto de matrícula con vehículo activo
+    # (La validación de unicidad del concern lo maneja, pero agregamos contexto)
+    existing = Vehicle.kept.where(matricula: matricula, company_id: company_id).where.not(id: id).first
+    if existing
+      errors << "Ya existe un vehículo activo con la matrícula '#{matricula}' " \
+                "en la compañía #{company.name} (ID: #{existing.id}). " \
+                "Debe cambiar la matrícula del vehículo existente o fusionar ambos registros."
+    end
+
+    errors
+  end
+
+  # Campos únicos para verificación automática antes de restaurar
+  def uniqueness_validations
+    [
+      { field: :matricula, scope: :company_id }
+    ]
+  end
+
+  # Hook: acciones después de restaurar
+  def after_soft_restore(context)
+    # Usuario
+    user = instance_variable_get(:@restoration_user)
+    context[:performed_by] = user if user
+
+    # Información de cascadas
+    cascades_restored = instance_variable_get(:@cascades_restored)
+    context[:cascades_restored] = cascades_restored if cascades_restored
+
+    # Contar qué se restauró en cascada
+    if cascades_restored
+      context[:restored_kms_count] = vehicle_kms.kept.count
+      context[:restored_maintenances_count] = maintenances.kept.count
+    end
+
+    # Log
+    Rails.logger.info(
+      "[RESTORE] Vehicle ##{id} restaurado: " \
+      "Matrícula #{matricula}, " \
+      "Compañía #{company.name}" +
+      (cascades_restored ?
+        " (con #{context[:restored_kms_count]} KMs y #{context[:restored_maintenances_count]} mantenimientos restaurados)" :
+        "")
+    )
+
+    # Recalcular current_km si se restauraron KMs
+    if cascades_restored && vehicle_kms.kept.any?
+      recalculate_current_km
+    end
+  end
+
+  # MÉTODOS PÚBLICOS
+  # Obtener último registro de KM válido
+  def latest_km_record
+    vehicle_kms.kept.ordered.first
+  end
+
+  # Obtener KM actual efectivo (del último registro)
+  def effective_current_km
+    latest_km_record&.effective_km || current_km
+  end
+
+  # Verificar si tiene registros conflictivos
+  def has_conflictive_kms?
+    if respond_to?(:conflictive_km_records)
+      conflictive_km_records > 0
+    else
+      vehicle_kms.kept.conflictive.exists?
+    end
+  end
+
+  # Estadísticas de KMs
+  def km_stats
+    {
+      total_records: vehicle_kms.kept.count,
+      conflictive: vehicle_kms.kept.conflictive.count,
+      corrected: vehicle_kms.kept.corrected.count,
+      original: vehicle_kms.kept.original.count,
+      manual: vehicle_kms.kept.manual.count,
+      from_maintenance: vehicle_kms.kept.from_maintenance.count,
+      oldest_date: vehicle_kms.kept.minimum(:input_date),
+      newest_date: vehicle_kms.kept.maximum(:input_date)
+    }
+  end
+
+  # Estadísticas de mantenimientos
+  def maintenance_stats
+    {
+      total: maintenances.kept.count,
+      total_cost: maintenances.kept.sum(:amount),
+      average_cost: maintenances.kept.average(:amount)&.to_f&.round(2),
+      with_km: maintenances.kept.with_km.count,
+      without_km: maintenances.kept.without_km.count,
+      oldest_date: maintenances.kept.minimum(:maintenance_date),
+      newest_date: maintenances.kept.maximum(:maintenance_date)
+    }
+  end
+
+  # MÉTODOS PÚBLICOS - UTILIDADES DE SOFT DELETE
+  # Resumen del impacto de borrar este vehículo
+  # Wrapper conveniente sobre el coordinador
+  def deletion_impact_summary
+    coordinator = SoftDelete::DeletionCoordinator.new(self)
+    preview = coordinator.preview
+
+    total_kms = vehicle_kms.kept.count
+    total_maintenances = maintenances.kept.count
+
+    {
+      can_proceed: preview[:can_proceed],
+      requires_force: preview[:requires_force],
+      total_records_to_delete: total_kms + total_maintenances,
+      vehicle_kms_count: total_kms,
+      maintenances_count: total_maintenances,
+      conflictive_kms_count: vehicle_kms.kept.conflictive.count,
+      warnings_count: preview[:impact][:warnings].count,
+      estimated_time: preview[:impact][:estimated_time],
+      recommendation: preview[:message]
+    }
+  end
+
+  # Verifica si la restauración es viable
+  def restoration_viability
+    analyzer = SoftDelete::RestorationAnalyzer.new(self)
+    info = analyzer.analyze
+
+    {
+      can_restore: info[:can_restore],
+      conflicts: info[:conflicts],
+      cascaded_records_count: (info[:cascaded_records] || []).sum { |c| c[:count] },
+      restore_options: info[:restore_options]&.map { |opt| opt[:type] },
+      recommendation: info[:recommendation]
+    }
+  end
+
+  # Descripción del estado para UI
+  def deletion_status_description
+    if kept?
+      "Activo"
+    else
+      deleted_at = discarded_at&.strftime("%d/%m/%Y %H:%M")
+      "Eliminado el #{deleted_at}"
+    end
+  end
+
+  private
+
+  # Recalcula current_km basado en los KMs restaurados
+  def recalculate_current_km
+    latest = vehicle_kms.kept.order(input_date: :desc, created_at: :desc).first
+    new_km = latest ? latest.effective_km : 0
+    update_columns(current_km: new_km)
+
+    Rails.logger.info(
+      "[RECALCULATE] Vehicle ##{id} current_km actualizado a #{new_km} km"
+    )
+  rescue StandardError => e
+    Rails.logger.error(
+      "[RECALCULATE ERROR] Error recalculating current_km for Vehicle ##{id}: #{e.message}"
+    )
+  end
+
+  # Métodos helper privados para futuras validaciones
+  # def has_active_leasing?
+  #   leasing_contracts.active.exists?
+  # end
+
+  # def has_active_driver_assignment?
+  #   driver_assignments.active.exists?
+  # end
+end
+# app/models/concerns/soft_deletable.rb
+module SoftDeletable
+  extend ActiveSupport::Concern
+
+  included do
+    include Discard::Model
+
+    # Callbacks automáticos del ciclo de vida
+    before_discard :execute_soft_delete_workflow
+    after_discard :execute_after_soft_delete_workflow
+
+    before_undiscard :execute_restore_workflow
+    after_undiscard :execute_after_restore_workflow
+  end
+
+  class_methods do
+    # Borrado seguro con validaciones y análisis de impacto
+    def soft_delete_with_validation(id, options = {})
+      record = find(id)
+      coordinator = SoftDelete::DeletionCoordinator.new(record, options)
+      coordinator.call
+    end
+
+    # Restauración segura con validaciones
+    def restore_with_validation(id, options = {})
+      record = discarded.find(id)
+      coordinator = SoftDelete::RestorationCoordinator.new(record, options)
+      coordinator.call
+    end
+
+    # Análisis de impacto sin ejecutar el borrado
+    def deletion_impact_for(id)
+      record = find(id)
+      record.deletion_impact
+    end
+  end
+
+  def soft_delete_cascade_relations
+    []
+  end
+
+  # Relaciones que IMPIDEN el borrado si tienen registros activos
+  def soft_delete_blocking_relations
+    []
+  end
+
+  # Relaciones que se desvinculan (FK = NULL) al borrar
+  def soft_delete_nullify_relations
+    []
+  end
+
+  # Validaciones personalizadas antes de borrar
+  def soft_delete_validations
+    []
+  end
+
+  # Hook ejecutado ANTES del borrado
+  def before_soft_delete(context)
+    # Override en cada modelo si es necesario
+  end
+
+  # Hook ejecutado DESPUÉS del borrado
+  def after_soft_delete(context)
+    # Override en cada modelo si es necesario
+  end
+
+  # Validaciones antes de restaurar
+  def validate_soft_restore
+    []
+  end
+
+  # Hook ejecutado DESPUÉS de la restauración
+  def after_soft_restore(context)
+    # Override en cada modelo si es necesario
+  end
+
+  # Campos únicos que deben verificarse antes de restaurar
+  def uniqueness_validations
+    []
+  end
+
+
+  # MÉTODOS PÚBLICOS DE INSTANCIA
+
+  # Analiza el impacto de borrar este registro
+  def deletion_impact
+    @deletion_impact ||= SoftDelete::ImpactAnalyzer.new(self).analyze
+  end
+
+  # Analiza la posibilidad de restaurar este registro
+  def restoration_info
+    @restoration_info ||= SoftDelete::RestorationAnalyzer.new(self).analyze
+  end
+
+  # ¿Se puede borrar este registro?
+  def can_be_deleted?
+    deletion_impact[:can_delete]
+  end
+
+  # ¿Se puede restaurar este registro?
+  def can_be_restored?
+    return false unless discarded?
+    restoration_info[:can_restore]
+  end
+
+  # Fuerza el borrado limpiando el cache de impacto
+  def recalculate_deletion_impact
+    @deletion_impact = nil
+    deletion_impact
+  end
+
+  private
+
+  # Ejecuta el workflow completo antes de marcar como discarded
+  def execute_soft_delete_workflow
+    @deletion_context = build_deletion_context
+
+    # PASO 1: Validaciones de negocio del modelo
+    validation_errors = normalize_validations(soft_delete_validations)
+
+    blockers = validation_errors.select { |v| v[:severity] == "blocker" }
+    if blockers.any?
+      blockers.each { |error| errors.add(:base, error[:message]) }
+      throw :abort
+    end
+
+    # PASO 2: Verificar relaciones bloqueantes
+    if has_blocking_relations?
+      errors.add(:base, blocking_relations_message)
+      throw :abort
+    end
+
+    # PASO 3: Hook pre-borrado (el modelo puede agregar al contexto)
+    before_soft_delete(@deletion_context)
+
+    # PASO 4: Procesar cascadas
+    process_cascade_relations
+
+    # PASO 5: Procesar nullify
+    process_nullify_relations
+
+    true
+  rescue StandardError => e
+    Rails.logger.error("[SOFT DELETE ERROR] #{self.class.name}##{id}: #{e.message}")
+    errors.add(:base, "Error interno: #{e.message}")
+    throw :abort
+  end
+
+  # Ejecuta acciones después del borrado
+  def execute_after_soft_delete_workflow
+    log_deletion
+    after_soft_delete(@deletion_context)
+    @deletion_context = nil
+  end
+
+  # Ejecuta el workflow completo antes de restaurar
+  def execute_restore_workflow
+    @restoration_context = build_restoration_context
+
+    # PASO 1: Validaciones del modelo
+    restore_errors = validate_soft_restore
+    if restore_errors.any?
+      restore_errors.each { |error| errors.add(:base, error) }
+      throw :abort
+    end
+
+    # PASO 2: Verificar conflictos de unicidad
+    check_uniqueness_conflicts
+
+    true
+  rescue StandardError => e
+    Rails.logger.error("[RESTORE ERROR] #{self.class.name}##{id}: #{e.message}")
+    errors.add(:base, "Error al restaurar: #{e.message}")
+    throw :abort
+  end
+
+  # Ejecuta acciones después de la restauración
+  def execute_after_restore_workflow
+    log_restoration
+    after_soft_restore(@restoration_context)
+    @restoration_context = nil
+  end
+
+  # Procesa relaciones en cascada
+  def process_cascade_relations
+    cascade_count = 0
+
+    soft_delete_cascade_relations.each do |config|
+      relation_name = config[:name]
+
+      # Verificar condición si existe
+      if config[:condition].is_a?(Proc)
+        next unless instance_exec(&config[:condition])
+      end
+
+      # Si es opcional, saltar (se maneja en el coordinador)
+      next if config[:optional]
+
+      begin
+        relation = send(relation_name)
+
+        # Manejar relaciones has_many
+        if relation.respond_to?(:each)
+          records = relation.respond_to?(:kept) ? relation.kept : relation
+          records.each do |record|
+            if record.respond_to?(:discard)
+              record.discard
+              cascade_count += 1
+            end
+          end
+        # Manejar relaciones belongs_to o has_one
+        elsif relation && relation.respond_to?(:discard)
+          relation.discard
+          cascade_count += 1
+        end
+      rescue StandardError => e
+        Rails.logger.error(
+          "[CASCADE ERROR] #{self.class.name}##{id} -> #{relation_name}: #{e.message}"
+        )
+      end
+    end
+
+    @deletion_context[:cascade_count] = cascade_count
+  end
+
+  # Procesa relaciones nullify (desvinculación)
+  def process_nullify_relations
+    nullify_count = 0
+
+    soft_delete_nullify_relations.each do |config|
+      model_class = config[:model].constantize
+      foreign_key = config[:foreign_key]
+
+      # Buscar registros que referencian a este
+      records = model_class.kept.where(foreign_key => id)
+      affected_count = records.count
+
+      if affected_count > 0
+        records.update_all(foreign_key => nil)
+        nullify_count += affected_count
+
+        if config[:notify]
+          Rails.logger.info(
+            "[NULLIFY] #{affected_count} registros de #{config[:model]} " \
+            "desvinculados de #{self.class.name}##{id}"
+          )
+        end
+      end
+    end
+
+    @deletion_context[:nullify_count] = nullify_count
+  end
+
+  # Verifica si existen relaciones que bloquean el borrado
+  def has_blocking_relations?
+    soft_delete_blocking_relations.any? do |config|
+      relation_name = config[:name]
+
+      begin
+        relation = send(relation_name)
+
+        if relation.respond_to?(:kept)
+          relation.kept.exists?
+        elsif relation.respond_to?(:exists?)
+          relation.exists?
+        else
+          relation.present?
+        end
+      rescue StandardError
+        false
+      end
+    end
+  end
+
+  # Construye mensaje de error para relaciones bloqueantes
+  def blocking_relations_message
+    messages = soft_delete_blocking_relations.map do |config|
+      relation_name = config[:name]
+      custom_message = config[:message]
+
+      begin
+        relation = send(relation_name)
+        count = if relation.respond_to?(:kept)
+                  relation.kept.count
+        elsif relation.respond_to?(:count)
+                  relation.count
+        else
+                  1
+        end
+
+        if custom_message
+          "#{count} #{custom_message}"
+        else
+          "#{count} #{relation_name.to_s.humanize.downcase} activos"
+        end
+      rescue StandardError
+        relation_name.to_s.humanize.downcase
+      end
+    end
+
+    "No se puede eliminar: tiene #{messages.join(', ')}"
+  end
+
+  # Verifica conflictos de unicidad antes de restaurar
+  def check_uniqueness_conflicts
+    uniqueness_validations.each do |validation|
+      field = validation[:field]
+      scope = validation[:scope]
+
+      query = self.class.kept.where(field => send(field))
+      query = query.where(scope => send(scope)) if scope
+      query = query.where.not(id: id)
+
+      if query.exists?
+        existing = query.first
+        field_name = field.to_s.humanize
+        field_value = send(field)
+
+        errors.add(
+          :base,
+          "Ya existe un registro activo con #{field_name}: '#{field_value}' (ID: #{existing.id})"
+        )
+        throw :abort
+      end
+    end
+  end
+
+  # Normaliza validaciones a formato estándar
+  # Convierte strings simples a hashes con severity
+  def normalize_validations(validations)
+    validations.map do |validation|
+      if validation.is_a?(String)
+        # String simple -> determinar severity por palabras clave
+        severity = if validation.include?("ADVERTENCIA")
+                     "warning"
+        elsif validation.include?("CRÍTICO") || validation.include?("BLOQUEADO")
+                     "blocker"
+        else
+                     "info"
+        end
+
+        { severity: severity, message: validation }
+      elsif validation.is_a?(Hash)
+        # Ya es hash, asegurar que tiene severity
+        validation[:severity] ||= "info"
+        validation
+      else
+        { severity: "info", message: validation.to_s }
+      end
+    end
+  end
+
+  # Construye el contexto inicial para el borrado
+  def build_deletion_context
+    {
+      model: self.class.name,
+      record_id: id,
+      deleted_at: Time.current,
+      cascade_count: 0,
+      nullify_count: 0,
+      performed_by: nil # Se puede agregar desde el coordinador
+    }
+  end
+
+  # Construye el contexto inicial para la restauración
+  def build_restoration_context
+    {
+      model: self.class.name,
+      record_id: id,
+      restored_at: Time.current,
+      performed_by: nil
+    }
+  end
+
+  # Registra el borrado en auditoría
+  def log_deletion
+    SoftDeleteAuditLog.create!(
+      record: self,
+      action: "delete",
+      context: @deletion_context,
+      cascade_count: @deletion_context[:cascade_count],
+      nullify_count: @deletion_context[:nullify_count],
+      performed_at: @deletion_context[:deleted_at],
+      performed_by: @deletion_context[:performed_by],
+      can_restore: true,
+      restore_complexity: calculate_restore_complexity
+    )
+  rescue StandardError => e
+    Rails.logger.error(
+      "[AUDIT ERROR] No se pudo registrar el borrado de #{self.class.name}##{id}: #{e.message}"
+    )
+  end
+
+  # Registra la restauración en auditoría
+  def log_restoration
+    SoftDeleteAuditLog.create!(
+      record: self,
+      action: "restore",
+      context: @restoration_context,
+      performed_at: @restoration_context[:restored_at],
+      performed_by: @restoration_context[:performed_by]
+    )
+  rescue StandardError => e
+    Rails.logger.error(
+      "[AUDIT ERROR] No se pudo registrar la restauración de #{self.class.name}##{id}: #{e.message}"
+    )
+  end
+
+  # Calcula la complejidad de restauración basada en cascadas
+  def calculate_restore_complexity
+    cascade_count = @deletion_context[:cascade_count] || 0
+
+    return "simple" if cascade_count == 0
+    return "medium" if cascade_count < 10
+    "complex"
+  end
+end

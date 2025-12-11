@@ -1,0 +1,1668 @@
+# app/services/soft_delete/deletion_coordinator.rb
+module SoftDelete
+  class DeletionCoordinator
+    attr_reader :record, :options, :impact
+
+    def initialize(record, options = {})
+      @record = record
+      @options = default_options.merge(options)
+      @impact = nil
+      @result = nil
+    end
+
+    # Ejecuta el borrado completo
+    def call
+      # FASE 1: Análisis previo
+      return failure_from_analysis unless analyze_and_validate
+
+      # FASE 2: Ejecución transaccional
+      execute_deletion
+    rescue StandardError => e
+      Rails.logger.error(
+        "[DELETION COORDINATOR] Error deleting #{@record.class.name}##{@record.id}: #{e.message}\n" \
+        "#{e.backtrace.first(5).join("\n")}"
+      )
+
+      failure_response(
+        errors: [ "Error interno: #{e.message}" ],
+        message: "No se pudo completar el borrado"
+      )
+    end
+
+    # Preview del impacto sin ejecutar el borrado
+    # Útil para mostrar al usuario antes de confirmar
+    def preview
+      @impact = analyze_impact
+
+      {
+        success: true,
+        can_proceed: @impact[:can_delete],
+        impact: @impact,
+        record: @record,
+        requires_force: requires_force?,
+        optional_cascades: extract_optional_cascades,
+        message: preview_message
+      }
+    end
+
+    private
+
+    # FASE 1: ANÁLISIS Y VALIDACIÓN
+
+    # Analiza y valida si se puede proceder con el borrado
+    #
+    def analyze_and_validate
+      # Saltar análisis si se especifica (uso interno)
+      return true if @options[:skip_analysis]
+
+      # Realizar análisis de impacto
+      @impact = analyze_impact
+
+      # Verificar blockers críticos (no se pueden forzar)
+      if @impact[:blockers].any?
+        @result = failure_response(
+          errors: @impact[:blockers].map { |b| b[:message] },
+          message: "El borrado está bloqueado",
+          impact: @impact
+        )
+        return false
+      end
+
+      # Verificar warnings (se pueden forzar con force: true)
+      if requires_force? && !@options[:force]
+        @result = failure_response(
+          errors: [],
+          warnings: @impact[:warnings].map { |w| w[:message] },
+          message: "El borrado requiere confirmación (use force: true)",
+          impact: @impact,
+          requires_force: true
+        )
+        return false
+      end
+
+      # Validar cascadas opcionales
+      unless validate_cascade_options
+        @result = failure_response(
+          errors: [ "Debe especificar qué hacer con las cascadas opcionales" ],
+          message: "Faltan decisiones sobre cascadas opcionales",
+          impact: @impact,
+          optional_cascades: extract_optional_cascades
+        )
+        return false
+      end
+
+      true
+    end
+
+    # Realiza el análisis de impacto
+    #
+    def analyze_impact
+      return @impact if @impact
+
+      analyzer = ImpactAnalyzer.new(@record)
+      analyzer.analyze
+    end
+
+    # Verifica si se requiere forzar el borrado
+    #
+    def requires_force?
+      return false unless @impact
+
+      warnings = @impact[:warnings] || []
+      forceable_warnings = warnings.select { |w| w[:can_force] }
+
+      forceable_warnings.any?
+    end
+
+    # Valida que se hayan especificado decisiones para cascadas opcionales
+    #
+    def validate_cascade_options
+      optional_cascades = extract_optional_cascades
+      return true if optional_cascades.empty?
+
+      cascade_options = @options[:cascade_options] || {}
+
+      optional_cascades.all? do |cascade|
+        relation_key = cascade[:relation].parameterize.underscore.to_sym
+        cascade_options.key?(relation_key)
+      end
+    end
+
+    # Extrae información de cascadas opcionales del impacto
+    #
+    def extract_optional_cascades
+      return [] unless @impact
+
+      (@impact[:will_cascade] || []).select { |c| c[:optional] }
+    end
+
+    # FASE 2: EJECUCIÓN DEL BORRADO
+
+    # Ejecuta el borrado dentro de una transacción
+    #
+    def execute_deletion
+      ActiveRecord::Base.transaction do
+        # Preparar contexto antes del borrado
+        prepare_deletion_context
+
+        # Procesar cascadas opcionales ANTES del discard
+        process_optional_cascades
+
+        # Ejecutar el discard (dispara los callbacks del concern)
+        # Los callbacks ejecutarán:
+        # - Validaciones del modelo
+        # - Verificación de bloqueos
+        # - before_soft_delete hook
+        # - Cascadas automáticas
+        # - Nullify
+        # - after_soft_delete hook
+        # - Auditoría
+        @record.discard
+
+        # Verificar si el discard fue exitoso
+        unless @record.discarded?
+          raise ActiveRecord::Rollback, "El registro no fue marcado como discarded"
+        end
+
+        # Obtener el log de auditoría creado por el concern
+        audit_log = find_audit_log
+
+        # Construir respuesta de éxito
+        @result = success_response(audit_log)
+      end
+
+      @result
+    end
+
+    # Prepara el contexto que será usado por el concern
+    #
+    def prepare_deletion_context
+      # El concern construye el contexto base, pero podemos agregar info adicional
+      # mediante el options hash que luego se usa en before_soft_delete
+
+      # Agregar usuario si está disponible
+      if @options[:user]
+        @record.instance_variable_set(:@deletion_user, @options[:user])
+      end
+
+      # Agregar información de cascadas opcionales procesadas
+      if @options[:cascade_options].present?
+        @record.instance_variable_set(:@cascade_decisions, @options[:cascade_options])
+      end
+    end
+
+    # Procesa cascadas opcionales según las decisiones del usuario
+    #
+    def process_optional_cascades
+      cascade_options = @options[:cascade_options] || {}
+      optional_cascades = extract_optional_cascades
+
+      optional_cascades.each do |cascade_info|
+        relation_name = cascade_info[:relation].parameterize.underscore.to_sym
+        decision = cascade_options[relation_name]
+
+        next unless decision == "delete"
+
+        # Obtener la configuración original de la relación
+        relation_config = @record.soft_delete_cascade_relations.find do |config|
+          config[:name].to_s.parameterize.underscore == relation_name.to_s
+        end
+
+        next unless relation_config
+
+        # Verificar condición si existe
+        if relation_config[:condition].is_a?(Proc)
+          next unless @record.instance_exec(&relation_config[:condition])
+        end
+
+        # Borrar la relación
+        delete_optional_cascade(relation_config[:name])
+      end
+    end
+
+    # Borra una cascada opcional específica
+    #
+    def delete_optional_cascade(relation_name)
+      begin
+        relation = @record.send(relation_name)
+
+        # Manejar has_many
+        if relation.respond_to?(:each)
+          records = relation.respond_to?(:kept) ? relation.kept : relation
+          records.each do |record|
+            record.discard if record.respond_to?(:discard)
+          end
+        # Manejar belongs_to o has_one
+        elsif relation && relation.respond_to?(:discard)
+          relation.discard
+        end
+
+        Rails.logger.info(
+          "[OPTIONAL CASCADE] Deleted #{relation_name} for #{@record.class.name}##{@record.id}"
+        )
+      rescue StandardError => e
+        Rails.logger.error(
+          "[OPTIONAL CASCADE ERROR] #{@record.class.name}##{@record.id} -> #{relation_name}: #{e.message}"
+        )
+      end
+    end
+
+    # Construye respuesta de éxito
+    #
+    def success_response(audit_log)
+      {
+        success: true,
+        record: @record,
+        impact: @impact,
+        audit_log: audit_log,
+        message: build_success_message,
+        warnings: extract_applied_warnings,
+        cascade_count: audit_log&.cascade_count || 0,
+        nullify_count: audit_log&.nullify_count || 0
+      }
+    end
+
+    # Construye respuesta de fallo
+    #
+    def failure_response(errors: [], warnings: [], message: nil, **extra)
+      {
+        success: false,
+        record: @record,
+        errors: errors,
+        warnings: warnings,
+        message: message || "No se pudo completar el borrado",
+        **extra
+      }
+    end
+
+    # Construye respuesta de fallo desde el análisis
+    #
+    def failure_from_analysis
+      return @result if @result
+
+      failure_response(
+        errors: [ "Error en el análisis de impacto" ],
+        message: "No se pudo analizar el impacto del borrado"
+      )
+    end
+
+    # HELPERS
+
+    # Opciones por defecto
+    #
+    def default_options
+      {
+        force: false,
+        user: nil,
+        cascade_options: {},
+        skip_analysis: false
+      }
+    end
+
+    # Encuentra el log de auditoría recién creado
+    #
+    def find_audit_log
+      SoftDeleteAuditLog
+        .deletions
+        .for_record(@record)
+        .order(performed_at: :desc)
+        .first
+    end
+
+    # Construye mensaje de éxito descriptivo
+    #
+    def build_success_message
+      parts = [ "#{@record.class.name} eliminado correctamente" ]
+
+      if @impact
+        cascade_count = @impact[:will_cascade].sum { |c| c[:count] }
+        nullify_count = @impact[:will_nullify].sum { |n| n[:count] }
+
+        if cascade_count > 0
+          parts << "#{cascade_count} registros eliminados en cascada"
+        end
+
+        if nullify_count > 0
+          parts << "#{nullify_count} registros desvinculados"
+        end
+      end
+
+      parts.join(". ")
+    end
+
+    # Extrae warnings que se aplicaron (si se usó force)
+    #
+    def extract_applied_warnings
+      return [] unless @options[:force] && @impact
+
+      (@impact[:warnings] || []).map { |w| w[:message] }
+    end
+
+    # Construye mensaje de preview
+    #
+    def preview_message
+      return @impact[:recommendation] if @impact
+
+      "Análisis no disponible"
+    end
+  end
+end
+# app/services/soft_delete/impact_analyzer.rb
+module SoftDelete
+  class ImpactAnalyzer
+    attr_reader :record
+
+    def initialize(record)
+      @record = record
+      @cache = {}
+    end
+
+    # Analiza el impacto completo del borrado
+    def analyze
+      {
+        can_delete: can_delete?,
+        blockers: find_blockers,
+        will_cascade: find_cascade_impact,
+        will_nullify: find_nullify_impact,
+        warnings: generate_warnings,
+        estimated_time: estimate_deletion_time,
+        recommendation: generate_recommendation,
+        total_affected: calculate_total_affected
+      }
+    end
+
+    private
+
+    # Verifica si el registro puede ser borrado
+    # Solo retorna false si hay blockers críticos
+    def can_delete?
+      find_blockers.empty?
+    end
+
+    # Encuentra todas las relaciones que bloquean el borrado
+    def find_blockers
+      return @cache[:blockers] if @cache[:blockers]
+
+      blockers = []
+
+      # BLOQUEOS POR RELACIONES
+      @record.soft_delete_blocking_relations.each do |relation_config|
+        blocker = analyze_blocking_relation(relation_config)
+        blockers << blocker if blocker
+      end
+
+      # BLOQUEOS POR VALIDACIONES DEL MODELO
+      validation_blockers = extract_validation_blockers
+      blockers.concat(validation_blockers)
+
+      @cache[:blockers] = blockers
+    end
+
+    # Analiza una relación bloqueante específica
+    def analyze_blocking_relation(relation_config)
+      relation_name = relation_config[:name]
+      custom_message = relation_config[:message]
+
+      begin
+        relation = @record.send(relation_name)
+        count = count_active_records(relation)
+
+        return nil if count.zero?
+
+        {
+          type: "relation",
+          relation: relation_name.to_s.humanize,
+          count: count,
+          severity: "critical",
+          message: build_blocking_message(relation_name, count, custom_message),
+          can_force: false
+        }
+      rescue StandardError => e
+        Rails.logger.error(
+          "[IMPACT ANALYZER] Error analyzing blocking relation #{relation_name}: #{e.message}"
+        )
+        nil
+      end
+    end
+
+    # Extrae blockers de las validaciones del modelo
+    def extract_validation_blockers
+      validations = @record.soft_delete_validations
+      normalized = normalize_validations(validations)
+
+      normalized.select { |v| v[:severity] == "blocker" }.map do |validation|
+        {
+          type: "validation",
+          severity: "critical",
+          message: validation[:message],
+          can_force: false
+        }
+      end
+    end
+
+    # Construye mensaje de bloqueo para relaciones
+    def build_blocking_message(relation_name, count, custom_message)
+      if custom_message
+        "Tiene #{count} #{custom_message}"
+      else
+        "Tiene #{count} #{relation_name.to_s.humanize.downcase} activos que impiden el borrado"
+      end
+    end
+
+    # Encuentra todos los registros que se borrarán en cascada
+    def find_cascade_impact
+      return @cache[:cascade_impact] if @cache[:cascade_impact]
+
+      cascade_items = []
+
+      @record.soft_delete_cascade_relations.each do |relation_config|
+        cascade_info = analyze_cascade_relation(relation_config)
+        cascade_items << cascade_info if cascade_info
+      end
+
+      @cache[:cascade_impact] = cascade_items
+    end
+
+    # Analiza una relación de cascada específica
+    def analyze_cascade_relation(relation_config)
+      relation_name = relation_config[:name]
+      is_optional = relation_config[:optional] || false
+
+      # Verificar condición si existe
+      if relation_config[:condition].is_a?(Proc)
+        return nil unless @record.instance_exec(&relation_config[:condition])
+      end
+
+      begin
+        relation = @record.send(relation_name)
+        count = count_active_records(relation)
+
+        return nil if count.zero?
+
+        {
+          relation: relation_name.to_s.humanize,
+          count: count,
+          model: extract_model_name(relation),
+          optional: is_optional,
+          action: is_optional ? "Opcional: puede borrar o mantener" : "Se borrarán automáticamente"
+        }
+      rescue StandardError => e
+        Rails.logger.error(
+          "[IMPACT ANALYZER] Error analyzing cascade relation #{relation_name}: #{e.message}"
+        )
+        nil
+      end
+    end
+
+    # Encuentra todos los registros que se desvincularán
+    def find_nullify_impact
+      return @cache[:nullify_impact] if @cache[:nullify_impact]
+
+      nullify_items = []
+
+      @record.soft_delete_nullify_relations.each do |relation_config|
+        nullify_info = analyze_nullify_relation(relation_config)
+        nullify_items << nullify_info if nullify_info
+      end
+
+      @cache[:nullify_impact] = nullify_items
+    end
+
+    # Analiza una relación de nullify específica
+    def analyze_nullify_relation(relation_config)
+      model_class = relation_config[:model].constantize
+      foreign_key = relation_config[:foreign_key]
+      relation_name = relation_config[:name] || model_class.name.pluralize
+
+      begin
+        count = model_class.kept.where(foreign_key => @record.id).count
+
+        return nil if count.zero?
+
+        {
+          relation: relation_name.to_s.humanize,
+          count: count,
+          model: model_class.name,
+          action: "Se desvinculará (foreign key = NULL)",
+          foreign_key: foreign_key
+        }
+      rescue StandardError => e
+        Rails.logger.error(
+          "[IMPACT ANALYZER] Error analyzing nullify relation for #{model_class}: #{e.message}"
+        )
+        nil
+      end
+    end
+
+    # Genera todas las advertencias del borrado
+    def generate_warnings
+      warnings = []
+
+      # ADVERTENCIAS DE VALIDACIONES DEL MODELO
+      model_warnings = extract_model_warnings
+      warnings.concat(model_warnings)
+
+      # ADVERTENCIAS DE CASCADAS MASIVAS
+      cascade_warnings = analyze_cascade_warnings
+      warnings.concat(cascade_warnings)
+
+      # ADVERTENCIAS ESPECÍFICAS DEL MODELO
+      specific_warnings = generate_model_specific_warnings
+      warnings.concat(specific_warnings)
+
+      warnings
+    end
+
+    # Extrae warnings de las validaciones del modelo
+    def extract_model_warnings
+      validations = @record.soft_delete_validations
+      normalized = normalize_validations(validations)
+
+      normalized.select { |v| v[:severity] != "blocker" }.map do |validation|
+        {
+          type: "validation",
+          message: validation[:message],
+          severity: validation[:severity],
+          can_force: validation[:severity] == "warning"
+        }
+      end
+    end
+
+    # Analiza advertencias relacionadas con cascadas
+    def analyze_cascade_warnings
+      warnings = []
+      total_cascade = find_cascade_impact.sum { |i| i[:count] }
+
+      if total_cascade > 100 && total_cascade <= 1000
+        warnings << {
+          type: "cascade",
+          message: "Se borrarán más de 100 registros en cascada (#{total_cascade} total)",
+          severity: "high",
+          can_force: true
+        }
+      end
+
+      if total_cascade > 1000
+        warnings << {
+          type: "cascade",
+          message: "OPERACIÓN MASIVA: #{total_cascade} registros se borrarán. " \
+                   "Esta operación puede tardar varios minutos.",
+          severity: "critical",
+          can_force: true
+        }
+      end
+
+      warnings
+    end
+
+    # Genera advertencias específicas según el tipo de modelo
+    def generate_model_specific_warnings
+      warnings = []
+
+      case @record.class.name
+      when "VehicleKm"
+        warnings.concat(vehicle_km_warnings)
+      when "Maintenance"
+        warnings.concat(maintenance_warnings)
+      when "Vehicle"
+        warnings.concat(vehicle_warnings)
+      when "Company"
+        warnings.concat(company_warnings)
+      end
+
+      warnings
+    end
+
+    # Advertencias específicas para VehicleKm
+    def vehicle_km_warnings
+      warnings = []
+
+      if @record.respond_to?(:from_maintenance?) && @record.from_maintenance?
+        warnings << {
+          type: "model_specific",
+          message: "Este registro fue creado desde un mantenimiento. El mantenimiento quedará desvinculado.",
+          severity: "medium",
+          can_force: true
+        }
+      end
+
+      if @record.respond_to?(:status) && @record.status == "corregido"
+        warnings << {
+          type: "model_specific",
+          message: "Este KM tiene correcciones automáticas que se perderán.",
+          severity: "medium",
+          can_force: true
+        }
+      end
+
+      warnings
+    end
+
+    # Advertencias específicas para Maintenance
+    def maintenance_warnings
+      warnings = []
+
+      if @record.respond_to?(:amount) && @record.amount.to_f > 1000
+        warnings << {
+          type: "model_specific",
+          message: "Este mantenimiento tiene un costo alto (#{@record.amount}€).",
+          severity: "medium",
+          can_force: true
+        }
+      end
+
+      warnings
+    end
+
+    # Advertencias específicas para Vehicle
+    def vehicle_warnings
+      warnings = []
+
+      if @record.respond_to?(:vehicle_kms)
+        km_count = @record.vehicle_kms.kept.count
+        if km_count > 100
+          warnings << {
+            type: "model_specific",
+            message: "Este vehículo tiene #{km_count} registros de KM que se borrarán.",
+            severity: "high",
+            can_force: true
+          }
+        end
+      end
+
+      warnings
+    end
+
+    # Advertencias específicas para Company
+    def company_warnings
+      warnings = []
+
+      total_data = find_cascade_impact.sum { |i| i[:count] }
+
+      if total_data > 500
+        warnings << {
+          type: "model_specific",
+          message: "Esta compañía tiene #{total_data} registros asociados. " \
+                   "La operación puede tardar varios minutos.",
+          severity: "high",
+          can_force: true
+        }
+      end
+
+      warnings
+    end
+
+    # Estima el tiempo que tardará el borrado
+    def estimate_deletion_time
+      total = calculate_total_affected
+
+      case total
+      when 0..10
+        "instant"
+      when 11..100
+        "seconds"
+      when 101..1000
+        "minutes"
+      else
+        "background_job"
+      end
+    end
+
+    # Genera una recomendación basada en el análisis
+    def generate_recommendation
+      blockers = find_blockers
+      return "BLOQUEADO: Resuelva los bloqueos antes de continuar" if blockers.any?
+
+      warnings = generate_warnings
+      critical_warnings = warnings.select { |w| w[:severity] == "critical" && !w[:can_force] }
+      return "BLOQUEADO: #{critical_warnings.first[:message]}" if critical_warnings.any?
+
+      high_warnings = warnings.select { |w| w[:severity] == "high" }
+      return "PRECAUCIÓN: Revise las advertencias antes de proceder" if high_warnings.any?
+
+      medium_warnings = warnings.select { |w| w[:severity] == "medium" }
+      return "ATENCIÓN: Revise las advertencias" if medium_warnings.any?
+
+      "OK: Seguro para borrar"
+    end
+
+    # Calcula el total de registros afectados
+    def calculate_total_affected
+      cascade_count = find_cascade_impact.sum { |i| i[:count] }
+      nullify_count = find_nullify_impact.sum { |i| i[:count] }
+
+      cascade_count + nullify_count
+    end
+
+    # Cuenta registros activos de una relación
+    def count_active_records(relation)
+      return 0 unless relation
+
+      if relation.respond_to?(:kept)
+        relation.kept.count
+      elsif relation.respond_to?(:count)
+        relation.count
+      elsif relation.respond_to?(:size)
+        relation.size
+      else
+        relation.present? ? 1 : 0
+      end
+    rescue StandardError
+      0
+    end
+
+    # Extrae el nombre del modelo de una relación
+    def extract_model_name(relation)
+      return nil unless relation
+
+      if relation.respond_to?(:klass)
+        relation.klass.name
+      elsif relation.respond_to?(:model_name)
+        relation.model_name.to_s
+      elsif relation.class.respond_to?(:model_name)
+        relation.class.model_name.to_s
+      else
+        relation.class.name
+      end
+    rescue StandardError
+      "Unknown"
+    end
+
+    # Normaliza validaciones a formato estándar
+    def normalize_validations(validations)
+      validations.map do |validation|
+        if validation.is_a?(String)
+          severity = detect_severity_from_message(validation)
+          { severity: severity, message: validation }
+        elsif validation.is_a?(Hash)
+          validation[:severity] ||= "info"
+          validation
+        else
+          { severity: "info", message: validation.to_s }
+        end
+      end
+    end
+
+    # Detecta la severidad desde el mensaje
+    def detect_severity_from_message(message)
+      return "warning" if message.include?("ADVERTENCIA")
+      return "blocker" if message.include?("CRÍTICO") || message.include?("BLOQUEADO")
+      return "high" if message.include?("IMPORTANTE")
+      "info"
+    end
+  end
+end
+# app/services/soft_delete/restoration_analyzer.rb
+module SoftDelete
+  class RestorationAnalyzer
+    attr_reader :record
+
+    def initialize(record)
+      @record = record
+      @cache = {}
+
+      unless @record.discarded?
+        raise ArgumentError, "El registro no está eliminado (discarded_at es NULL)"
+      end
+    end
+
+    # Analiza la viabilidad de restauración completa
+
+    def analyze
+      {
+        can_restore: can_restore?,
+        conflicts: find_conflicts,
+        cascaded_records: find_cascaded_records,
+        restore_options: generate_restore_options,
+        estimated_time: estimate_restoration_time,
+        recommendation: generate_recommendation,
+        deletion_log: find_deletion_log
+      }
+    end
+
+    private
+
+    # Verifica si el registro puede ser restaurado
+    # Solo retorna false si hay conflictos críticos
+    def can_restore?
+      find_conflicts.none? { |c| c[:type] == "blocker" }
+    end
+
+    # Encuentra todos los conflictos que impiden o dificultan la restauración
+    def find_conflicts
+      return @cache[:conflicts] if @cache[:conflicts]
+
+      conflicts = []
+
+      # CONFLICTOS DE UNICIDAD
+      uniqueness_conflicts = check_uniqueness_conflicts
+      conflicts.concat(uniqueness_conflicts)
+
+      # CONFLICTOS CON PADRES ELIMINADOS
+      parent_conflicts = check_parent_relations
+      conflicts.concat(parent_conflicts)
+
+      # CONFLICTOS POR VALIDACIONES DEL MODELO
+      validation_conflicts = extract_validation_conflicts
+      conflicts.concat(validation_conflicts)
+
+      @cache[:conflicts] = conflicts
+    end
+
+    # Verifica conflictos de unicidad con registros activos
+    def check_uniqueness_conflicts
+      conflicts = []
+
+      @record.uniqueness_validations.each do |validation|
+        conflict = analyze_uniqueness_validation(validation)
+        conflicts << conflict if conflict
+      end
+
+      conflicts
+    end
+
+    # Analiza una validación de unicidad específica
+    def analyze_uniqueness_validation(validation)
+      field = validation[:field]
+      scope = validation[:scope]
+
+      # Construir query para buscar registros activos con el mismo valor
+      query = @record.class.kept.where(field => @record.send(field))
+      query = query.where(scope => @record.send(scope)) if scope
+      query = query.where.not(id: @record.id)
+
+      return nil unless query.exists?
+
+      existing = query.first
+      field_name = field.to_s.humanize
+      field_value = @record.send(field)
+
+      {
+        type: "blocker",
+        category: "uniqueness",
+        field: field_name,
+        value: field_value,
+        existing_record_id: existing.id,
+        existing_record_type: existing.class.name,
+        message: "Ya existe un registro activo con #{field_name}: '#{field_value}' (#{existing.class.name} ##{existing.id})",
+        severity: "critical",
+        suggestion: "Debe cambiar el #{field_name} del registro existente o fusionar ambos registros"
+      }
+    rescue StandardError => e
+      Rails.logger.error(
+        "[RESTORATION ANALYZER] Error checking uniqueness for #{field}: #{e.message}"
+      )
+      nil
+    end
+
+    # Verifica conflictos con relaciones padre eliminadas
+    def check_parent_relations
+      conflicts = []
+
+      case @record.class.name
+      when "Vehicle"
+        conflicts.concat(check_vehicle_parent_relations)
+      when "VehicleKm"
+        conflicts.concat(check_vehicle_km_parent_relations)
+      when "Maintenance"
+        conflicts.concat(check_maintenance_parent_relations)
+      end
+
+      conflicts
+    end
+
+    # Conflictos de Vehicle (padre: Company)
+    def check_vehicle_parent_relations
+      return [] unless @record.respond_to?(:company)
+
+      company = @record.company
+
+      return [] unless company&.discarded?
+
+      [ {
+        type: "blocker",
+        category: "parent_deleted",
+        relation: "Company",
+        parent_id: company.id,
+        parent_name: company.name,
+        message: "La compañía asociada '#{company.name}' (ID: #{company.id}) fue eliminada",
+        severity: "critical",
+        suggestion: "Debe restaurar primero la compañía o reasignar el vehículo a otra compañía"
+      } ]
+    end
+
+    # Conflictos de VehicleKm (padre: Vehicle)
+    def check_vehicle_km_parent_relations
+      return [] unless @record.respond_to?(:vehicle)
+
+      vehicle = @record.vehicle
+
+      return [] unless vehicle&.discarded?
+
+      [ {
+        type: "blocker",
+        category: "parent_deleted",
+        relation: "Vehicle",
+        parent_id: vehicle.id,
+        parent_name: vehicle.matricula,
+        message: "El vehículo asociado '#{vehicle.matricula}' (ID: #{vehicle.id}) fue eliminado",
+        severity: "critical",
+        suggestion: "Debe restaurar primero el vehículo"
+      } ]
+    end
+
+    # Conflictos de Maintenance (padre: Vehicle)
+    def check_maintenance_parent_relations
+      return [] unless @record.respond_to?(:vehicle)
+
+      vehicle = @record.vehicle
+
+      return [] unless vehicle&.discarded?
+
+      [ {
+        type: "blocker",
+        category: "parent_deleted",
+        relation: "Vehicle",
+        parent_id: vehicle.id,
+        parent_name: vehicle.matricula,
+        message: "El vehículo asociado '#{vehicle.matricula}' (ID: #{vehicle.id}) fue eliminado",
+        severity: "critical",
+        suggestion: "Debe restaurar primero el vehículo"
+      } ]
+    end
+
+    # Extrae conflictos de las validaciones del modelo
+    def extract_validation_conflicts
+      validation_errors = @record.validate_soft_restore
+
+      validation_errors.map do |error_message|
+        {
+          type: "blocker",
+          category: "validation",
+          message: error_message,
+          severity: "high",
+          suggestion: "Resuelva este problema antes de restaurar"
+        }
+      end
+    end
+
+    # Encuentra registros borrados en cascada que pueden restaurarse junto a este
+    def find_cascaded_records
+      return @cache[:cascaded_records] if @cache[:cascaded_records]
+
+      cascaded = []
+      deletion_log = find_deletion_log
+
+      # Si no hay log o no hubo cascadas, retornar vacío
+      return cascaded unless deletion_log
+      return cascaded if deletion_log.cascade_count == 0
+
+      # Analizar cada relación de cascada del modelo
+      @record.soft_delete_cascade_relations.each do |relation_config|
+        cascade_info = analyze_cascaded_relation(relation_config, deletion_log)
+        cascaded << cascade_info if cascade_info
+      end
+
+      @cache[:cascaded_records] = cascaded
+    end
+
+    # Analiza una relación de cascada para restauración
+    def analyze_cascaded_relation(relation_config, deletion_log)
+      relation_name = relation_config[:name]
+
+      begin
+        relation = @record.send(relation_name)
+
+        # Contar registros discarded en la relación
+        discarded_count = if relation.respond_to?(:discarded)
+                            relation.discarded.count
+        else
+                            0
+        end
+
+        return nil if discarded_count.zero?
+
+        {
+          relation: relation_name.to_s.humanize,
+          count: discarded_count,
+          model: extract_model_name_from_relation(relation),
+          can_restore_cascade: true,
+          deleted_at: deletion_log.performed_at,
+          recommendation: build_cascade_recommendation(discarded_count)
+        }
+      rescue StandardError => e
+        Rails.logger.error(
+          "[RESTORATION ANALYZER] Error analyzing cascaded relation #{relation_name}: #{e.message}"
+        )
+        nil
+      end
+    end
+
+    # Construye recomendación para cascadas
+    def build_cascade_recommendation(count)
+      if count <= 10
+        "Recomendado: restaurar en cascada (#{count} registros)"
+      elsif count <= 100
+        "Opcional: restaurar en cascada (#{count} registros, puede tardar)"
+      else
+        "Precaución: restaurar en cascada (#{count} registros, operación pesada)"
+      end
+    end
+
+    # Genera todas las opciones disponibles de restauración
+    def generate_restore_options
+      options = []
+      cascaded = find_cascaded_records
+      conflicts = find_conflicts
+
+      # OPCIÓN 1: Restauración simple (solo el registro principal)
+      options << build_simple_restore_option(cascaded)
+
+      # OPCIÓN 2: Restauración en cascada (si hay cascadas)
+      if cascaded.any?
+        options << build_cascade_restore_option(cascaded)
+      end
+
+      # OPCIÓN 3: Fusión con registro existente (si hay conflictos de unicidad)
+      uniqueness_conflicts = conflicts.select { |c| c[:category] == "uniqueness" }
+      if uniqueness_conflicts.any?
+        options << build_merge_option(uniqueness_conflicts)
+      end
+
+      # OPCIÓN 4: Restauración con reasignación (si hay conflictos de padre)
+      parent_conflicts = conflicts.select { |c| c[:category] == "parent_deleted" }
+      if parent_conflicts.any?
+        options << build_reassign_option(parent_conflicts)
+      end
+
+      options
+    end
+
+    # Opción de restauración simple
+    def build_simple_restore_option(cascaded)
+      {
+        type: "simple",
+        name: "Restauración simple",
+        description: "Restaurar solo este registro",
+        will_restore_count: 1,
+        leaves_orphaned: cascaded.any?,
+        recommended: cascaded.empty?,
+        complexity: "simple",
+        estimated_time: "instant",
+        warnings: cascaded.any? ? [ "Dejará #{cascaded.sum { |c| c[:count] }} registros relacionados sin restaurar" ] : []
+      }
+    end
+
+    # Opción de restauración en cascada
+    def build_cascade_restore_option(cascaded)
+      total_cascade = cascaded.sum { |c| c[:count] }
+
+      {
+        type: "cascade",
+        name: "Restauración en cascada",
+        description: "Restaurar este registro y #{total_cascade} registros relacionados",
+        will_restore_count: 1 + total_cascade,
+        cascaded_details: cascaded,
+        recommended: true,
+        complexity: calculate_complexity(total_cascade),
+        estimated_time: estimate_time(total_cascade),
+        warnings: total_cascade > 100 ? [ "Esta operación puede tardar varios minutos" ] : []
+      }
+    end
+
+    # Opción de fusión con registro existente
+    #
+    def build_merge_option(uniqueness_conflicts)
+      {
+        type: "merge",
+        name: "Fusión con registro existente",
+        description: "Fusionar datos con el registro activo que tiene los mismos valores únicos",
+        will_restore_count: 0,
+        requires_manual_action: true,
+        recommended: false,
+        complexity: "complex",
+        estimated_time: "manual",
+        conflicts: uniqueness_conflicts,
+        warnings: [ "Requiere intervención manual para decidir qué datos conservar" ]
+      }
+    end
+
+    # Opción de reasignación
+    def build_reassign_option(parent_conflicts)
+      {
+        type: "reassign",
+        name: "Restauración con reasignación",
+        description: "Restaurar el registro asignándolo a otra relación padre activa",
+        will_restore_count: 1,
+        requires_manual_action: true,
+        recommended: false,
+        complexity: "medium",
+        estimated_time: "manual",
+        conflicts: parent_conflicts,
+        warnings: [ "Debe seleccionar manualmente el nuevo padre antes de restaurar" ]
+      }
+    end
+
+    # Estima el tiempo que tardará la restauración
+    def estimate_restoration_time
+      cascaded = find_cascaded_records
+      total = cascaded.sum { |c| c[:count] }
+
+      estimate_time(total)
+    end
+
+    # Genera una recomendación basada en el análisis
+    def generate_recommendation
+      conflicts = find_conflicts
+      cascaded = find_cascaded_records
+
+      # Blockers críticos
+      blockers = conflicts.select { |c| c[:type] == "blocker" }
+
+      parent_blockers = blockers.select { |c| c[:category] == "parent_deleted" }
+      if parent_blockers.any?
+        parent = parent_blockers.first
+        return "BLOQUEADO: Debe restaurar primero #{parent[:relation]} ##{parent[:parent_id]}"
+      end
+
+      uniqueness_blockers = blockers.select { |c| c[:category] == "uniqueness" }
+      if uniqueness_blockers.any?
+        return "CONFLICTO: Ya existe un registro activo con los mismos datos únicos. " \
+               "Debe cambiar el registro existente o fusionar ambos."
+      end
+
+      validation_blockers = blockers.select { |c| c[:category] == "validation" }
+      if validation_blockers.any?
+        return "PRECAUCIÓN: #{validation_blockers.first[:message]}"
+      end
+
+      # Sin blockers, evaluar cascadas
+      if cascaded.any?
+        total = cascaded.sum { |c| c[:count] }
+
+        if total > 100
+          return "RECOMENDADO: Restaurar en cascada con precaución (#{total} registros relacionados)"
+        else
+          return "SUGERIDO: Restaurar en cascada (#{total} registros relacionados)"
+        end
+      end
+
+      "OK: Seguro para restaurar"
+    end
+
+    # Encuentra el log de borrado de este registro
+    def find_deletion_log
+      return @cache[:deletion_log] if @cache.key?(:deletion_log)
+
+      @cache[:deletion_log] = SoftDeleteAuditLog
+        .deletions
+        .for_record(@record)
+        .order(performed_at: :desc)
+        .first
+    end
+
+    # Extrae el nombre del modelo de una relación
+    def extract_model_name_from_relation(relation)
+      return nil unless relation
+
+      if relation.respond_to?(:klass)
+        relation.klass.name
+      elsif relation.respond_to?(:model_name)
+        relation.model_name.to_s
+      elsif relation.class.respond_to?(:model_name)
+        relation.class.model_name.to_s
+      else
+        relation.class.name
+      end
+    rescue StandardError
+      "Unknown"
+    end
+
+    # Calcula complejidad basada en cantidad
+    def calculate_complexity(count)
+      return "simple" if count == 0
+      return "medium" if count < 10
+      "complex"
+    end
+
+    # Estima tiempo basado en cantidad
+    def estimate_time(count)
+      case count
+      when 0..10
+        "instant"
+      when 11..100
+        "seconds"
+      when 101..1000
+        "minutes"
+      else
+        "background_job"
+      end
+    end
+  end
+end
+# app/services/soft_delete/restoration_coordinator.rb
+module SoftDelete
+  class RestorationCoordinator
+    attr_reader :record, :options, :restoration_info
+
+    def initialize(record, options = {})
+      @record = record
+      @options = default_options.merge(options)
+      @restoration_info = nil
+      @result = nil
+
+      # Validar que el registro esté borrado
+      unless @record.discarded?
+        raise ArgumentError,
+              "El registro #{@record.class.name}##{@record.id} no está eliminado (discarded_at es NULL)"
+      end
+    end
+
+    def call
+      # FASE 1: Análisis previo
+      return failure_from_analysis unless analyze_and_validate
+
+      # FASE 2: Ejecución transaccional
+      execute_restoration
+    rescue StandardError => e
+      Rails.logger.error(
+        "[RESTORATION COORDINATOR] Error restoring #{@record.class.name}##{@record.id}: #{e.message}\n" \
+        "#{e.backtrace.first(5).join("\n")}"
+      )
+
+      failure_response(
+        errors: [ "Error interno: #{e.message}" ],
+        message: "No se pudo completar la restauración"
+      )
+    end
+
+    # Preview de la restauración sin ejecutarla
+    def preview
+      @restoration_info = analyze_restoration
+
+      {
+        success: true,
+        can_proceed: @restoration_info[:can_restore],
+        restoration_info: @restoration_info,
+        record: @record,
+        requires_decisions: requires_decisions?,
+        restore_options: @restoration_info[:restore_options],
+        message: preview_message
+      }
+    end
+
+    private
+
+    # FASE 1: ANÁLISIS Y VALIDACIÓN
+
+    # Analiza y valida si se puede proceder con la restauración
+    def analyze_and_validate
+      # Saltar análisis si se especifica (uso interno)
+      return true if @options[:skip_analysis]
+
+      # Realizar análisis de restauración
+      @restoration_info = analyze_restoration
+
+      # Verificar conflictos críticos (blockers)
+      blockers = extract_blockers
+      if blockers.any?
+        @result = failure_response(
+          errors: blockers.map { |b| b[:message] },
+          message: "La restauración está bloqueada",
+          restoration_info: @restoration_info,
+          conflicts: blockers
+        )
+        return false
+      end
+
+      # Verificar que se hayan tomado decisiones necesarias
+      unless validate_required_decisions
+        @result = failure_response(
+          errors: [ "Faltan decisiones necesarias para restaurar" ],
+          message: "Se requieren decisiones adicionales",
+          restoration_info: @restoration_info,
+          required_decisions: extract_required_decisions
+        )
+        return false
+      end
+
+      true
+    end
+
+    # Realiza el análisis de restauración
+    def analyze_restoration
+      return @restoration_info if @restoration_info
+
+      analyzer = RestorationAnalyzer.new(@record)
+      analyzer.analyze
+    end
+
+    # Extrae conflictos bloqueantes del análisis
+    def extract_blockers
+      return [] unless @restoration_info
+
+      conflicts = @restoration_info[:conflicts] || []
+      conflicts.select { |c| c[:type] == "blocker" }
+    end
+
+    # Verifica si se requieren decisiones del usuario
+    def requires_decisions?
+      return false unless @restoration_info
+
+      # Decisiones de cascada
+      has_cascades = @restoration_info[:cascaded_records]&.any?
+      cascade_decision_needed = has_cascades && !@options[:cascade_restore].nil? == false
+
+      # Decisiones de reasignación
+      parent_conflicts = (@restoration_info[:conflicts] || []).select do |c|
+        c[:category] == "parent_deleted"
+      end
+      reassign_needed = parent_conflicts.any? && @options[:reassign_to].blank?
+
+      cascade_decision_needed || reassign_needed
+    end
+
+    # Valida que se hayan tomado las decisiones necesarias
+    def validate_required_decisions
+      # Si hay conflictos de padre borrado, debe especificar reasignación
+      parent_conflicts = (@restoration_info[:conflicts] || []).select do |c|
+        c[:category] == "parent_deleted"
+      end
+
+      if parent_conflicts.any? && @options[:reassign_to].blank?
+        return false
+      end
+
+      # Si hay cascadas y se eligió restaurar solo algunas, validar
+      if @options[:selected_cascades].present?
+        cascaded = @restoration_info[:cascaded_records] || []
+        valid_cascades = cascaded.map { |c| c[:relation].parameterize.underscore.to_sym }
+
+        invalid = @options[:selected_cascades] - valid_cascades
+        return false if invalid.any?
+      end
+
+      true
+    end
+
+    # Extrae decisiones requeridas
+    def extract_required_decisions
+      decisions = []
+
+      # Decisión sobre cascadas
+      cascaded = @restoration_info[:cascaded_records] || []
+      if cascaded.any?
+        decisions << {
+          type: "cascade",
+          description: "Decidir si restaurar registros en cascada",
+          options: [ "cascade_restore: true/false", "selected_cascades: [:relation1, ...]" ],
+          cascades_available: cascaded
+        }
+      end
+
+      # Decisión sobre reasignación
+      parent_conflicts = (@restoration_info[:conflicts] || []).select do |c|
+        c[:category] == "parent_deleted"
+      end
+
+      if parent_conflicts.any?
+        parent_conflicts.each do |conflict|
+          decisions << {
+            type: "reassign",
+            description: "Reasignar #{conflict[:relation]}",
+            options: "reassign_to: { #{conflict[:relation].underscore}_id: NEW_ID }",
+            conflict: conflict
+          }
+        end
+      end
+
+      decisions
+    end
+
+    # FASE 2: EJECUCIÓN DE LA RESTAURACIÓN
+
+    # Ejecuta la restauración dentro de una transacción
+    def execute_restoration
+      restored_count = 0
+
+      ActiveRecord::Base.transaction do
+        # 1. Resolver conflictos (reasignación si es necesario)
+        resolve_conflicts
+
+        # 2. Restaurar registros en cascada (ANTES del undiscard principal)
+        restored_count += restore_cascaded_records if should_restore_cascades?
+
+        # 3. Preparar contexto
+        prepare_restoration_context
+
+        # 4. Ejecutar undiscard (dispara callbacks del concern)
+        @record.undiscard
+
+        # 5. Verificar éxito
+        unless @record.kept?
+          raise ActiveRecord::Rollback, "El registro no fue restaurado"
+        end
+
+        restored_count += 1
+
+        # 6. Obtener el log de auditoría creado
+        audit_log = find_audit_log
+
+        # 7. Construir respuesta de éxito
+        @result = success_response(audit_log, restored_count)
+      end
+
+      @result
+    end
+
+    # Resuelve conflictos antes de restaurar
+    def resolve_conflicts
+      # Reasignar relaciones padre si se especificó
+      if @options[:reassign_to].present?
+        @options[:reassign_to].each do |attribute, new_value|
+          if @record.respond_to?("#{attribute}=")
+            @record.send("#{attribute}=", new_value)
+
+            Rails.logger.info(
+              "[RESTORATION] Reassigning #{attribute} to #{new_value} for #{@record.class.name}##{@record.id}"
+            )
+          end
+        end
+      end
+    end
+
+    # Verifica si debe restaurar cascadas
+    def should_restore_cascades?
+      @options[:cascade_restore] == true || @options[:selected_cascades].present?
+    end
+
+    # Restaura registros borrados en cascada
+    def restore_cascaded_records
+      restored_count = 0
+      cascaded = @restoration_info[:cascaded_records] || []
+
+      # Filtrar solo las cascadas seleccionadas si se especificó
+      if @options[:selected_cascades].present?
+        selected = @options[:selected_cascades].map(&:to_s).map(&:parameterize).map(&:underscore)
+        cascaded = cascaded.select do |cascade|
+          selected.include?(cascade[:relation].parameterize.underscore)
+        end
+      end
+
+      cascaded.each do |cascade_info|
+        relation_name = cascade_info[:relation].parameterize.underscore.to_sym
+
+        begin
+          # Obtener la configuración de la relación del modelo
+          relation_config = @record.soft_delete_cascade_relations.find do |config|
+            config[:name].to_s.parameterize.underscore == relation_name.to_s
+          end
+
+          next unless relation_config
+
+          count = restore_cascade_relation(relation_config[:name])
+          restored_count += count
+
+          Rails.logger.info(
+            "[RESTORATION CASCADE] Restored #{count} #{relation_name} for #{@record.class.name}##{@record.id}"
+          )
+        rescue StandardError => e
+          Rails.logger.error(
+            "[RESTORATION CASCADE ERROR] #{@record.class.name}##{@record.id} -> #{relation_name}: #{e.message}"
+          )
+        end
+      end
+
+      restored_count
+    end
+
+    # Restaura una relación en cascada específica
+    def restore_cascade_relation(relation_name)
+      count = 0
+
+      begin
+        relation = @record.send(relation_name)
+
+        # Manejar has_many
+        if relation.respond_to?(:discarded)
+          records = relation.discarded
+          records.each do |record|
+            record.undiscard if record.respond_to?(:undiscard)
+            count += 1
+          end
+        # Manejar has_one o belongs_to
+        elsif relation&.discarded?
+          relation.undiscard if relation.respond_to?(:undiscard)
+          count += 1
+        end
+      rescue StandardError => e
+        Rails.logger.error(
+          "[RESTORE CASCADE] Error restoring #{relation_name}: #{e.message}"
+        )
+      end
+
+      count
+    end
+
+    # Prepara el contexto que será usado por el concern
+    def prepare_restoration_context
+      # Agregar usuario si está disponible
+      if @options[:user]
+        @record.instance_variable_set(:@restoration_user, @options[:user])
+      end
+
+      # Agregar información de cascadas restauradas
+      if @options[:cascade_restore] || @options[:selected_cascades].present?
+        @record.instance_variable_set(:@cascades_restored, true)
+      end
+
+      # Agregar información de reasignación
+      if @options[:reassign_to].present?
+        @record.instance_variable_set(:@reassignments, @options[:reassign_to])
+      end
+    end
+
+    # Construye respuesta de éxito
+    def success_response(audit_log, restored_count)
+      {
+        success: true,
+        record: @record,
+        restoration_info: @restoration_info,
+        audit_log: audit_log,
+        message: build_success_message(restored_count),
+        restored_count: restored_count,
+        warnings: extract_applied_warnings
+      }
+    end
+
+    # Construye respuesta de fallo
+    def failure_response(errors: [], warnings: [], message: nil, **extra)
+      {
+        success: false,
+        record: @record,
+        errors: errors,
+        warnings: warnings,
+        message: message || "No se pudo completar la restauración",
+        **extra
+      }
+    end
+
+    # Construye respuesta de fallo desde el análisis
+    def failure_from_analysis
+      return @result if @result
+
+      failure_response(
+        errors: [ "Error en el análisis de restauración" ],
+        message: "No se pudo analizar la viabilidad de restauración"
+      )
+    end
+
+    # Opciones por defecto
+    def default_options
+      {
+        cascade_restore: false,
+        selected_cascades: nil,
+        user: nil,
+        reassign_to: {},
+        skip_analysis: false,
+        force_conflicts: false
+      }
+    end
+
+    # Encuentra el log de auditoría recién creado
+    def find_audit_log
+      SoftDeleteAuditLog
+        .restorations
+        .for_record(@record)
+        .order(performed_at: :desc)
+        .first
+    end
+
+    # Construye mensaje de éxito descriptivo
+    def build_success_message(restored_count)
+      parts = [ "#{@record.class.name} restaurado correctamente" ]
+
+      if restored_count > 1
+        cascade_count = restored_count - 1
+        parts << "#{cascade_count} registros restaurados en cascada"
+      end
+
+      if @options[:reassign_to].present?
+        parts << "con reasignación de relaciones padre"
+      end
+
+      parts.join(". ")
+    end
+
+    # Extrae warnings aplicados
+    def extract_applied_warnings
+      warnings = []
+
+      # Advertencias sobre cascadas no restauradas
+      cascaded = @restoration_info[:cascaded_records] || []
+      if cascaded.any? && !@options[:cascade_restore] && @options[:selected_cascades].blank?
+        total = cascaded.sum { |c| c[:count] }
+        warnings << "#{total} registros relacionados NO fueron restaurados"
+      end
+
+      # Advertencias sobre cascadas parciales
+      if @options[:selected_cascades].present?
+        all_cascades = cascaded.map { |c| c[:relation].parameterize.underscore.to_sym }
+        not_restored = all_cascades - @options[:selected_cascades]
+
+        if not_restored.any?
+          warnings << "Algunas cascadas NO fueron restauradas: #{not_restored.join(', ')}"
+        end
+      end
+
+      warnings
+    end
+
+    # Construye mensaje de preview
+    def preview_message
+      return @restoration_info[:recommendation] if @restoration_info
+
+      "Análisis no disponible"
+    end
+  end
+end

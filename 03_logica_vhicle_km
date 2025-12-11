@@ -1,0 +1,861 @@
+# app/services/vehicle_kms/conflict_detector_service.rb
+#
+# Detección de conflictos basada en SUBSECUENCIA CRECIENTE MÁS LARGA
+# PASO 1: Detecta SI hay conflicto (prev/new/next)
+# PASO 2: Encuentra la secuencia creciente más larga y marca el resto como conflictivos
+#
+module VehicleKms
+  class ConflictDetectorService
+    def initialize(vehicle_km)
+      @vehicle_km = vehicle_km
+      @vehicle = vehicle_km.vehicle
+    end
+
+    def call
+      prev_record = find_immediate_previous
+      next_record = find_immediate_next
+
+      has_immediate_conflict = detect_immediate_conflict(prev_record, next_record)
+
+      if has_immediate_conflict
+        diagnosis = find_longest_increasing_subsequence
+
+        {
+          has_conflict: true,
+          current_is_conflictive: diagnosis[:conflictive_ids].include?(@vehicle_km.id),
+          conflictive_records: diagnosis[:conflictive_records],
+          valid_records: diagnosis[:valid_ids]
+        }
+      else
+        diagnosis = find_longest_increasing_subsequence
+
+        {
+          has_conflict: diagnosis[:conflictive_ids].any?,
+          current_is_conflictive: diagnosis[:conflictive_ids].include?(@vehicle_km.id),
+          conflictive_records: diagnosis[:conflictive_records],
+          valid_records: diagnosis[:valid_ids]
+        }
+      end
+    end
+
+    private
+
+    def find_immediate_previous
+      VehicleKm.kept
+        .where(vehicle_id: @vehicle.id)
+        .where("input_date < ? OR (input_date = ? AND id < ?)",
+               @vehicle_km.input_date,
+               @vehicle_km.input_date,
+               @vehicle_km.id)
+        .order(input_date: :desc, id: :desc)
+        .first
+    end
+
+    def find_immediate_next
+      VehicleKm.kept
+        .where(vehicle_id: @vehicle.id)
+        .where("input_date > ? OR (input_date = ? AND id > ?)",
+               @vehicle_km.input_date,
+               @vehicle_km.input_date,
+               @vehicle_km.id)
+        .order(input_date: :asc, id: :asc)
+        .first
+    end
+
+    def detect_immediate_conflict(prev_record, next_record)
+      current_km = @vehicle_km.km_reported
+
+      if prev_record && !next_record
+        return current_km < prev_record.km_reported
+      end
+
+      if !prev_record && next_record
+        return current_km > next_record.km_reported
+      end
+
+      if prev_record && next_record
+        prev_km = prev_record.km_reported
+        next_km = next_record.km_reported
+        return !(prev_km <= current_km && current_km <= next_km)
+      end
+
+      false
+    end
+
+    def find_longest_increasing_subsequence
+      window = build_extended_window
+      ordered_window = window.sort_by { |r| [ r.input_date, r.id ] }
+
+      return empty_result if ordered_window.empty?
+
+      valid_ids = calculate_lis(ordered_window)
+      conflictive_ids = ordered_window.map(&:id) - valid_ids
+      conflictive_records = build_conflict_details(conflictive_ids, ordered_window)
+
+      {
+        conflictive_ids: conflictive_ids,
+        valid_ids: valid_ids,
+        conflictive_records: conflictive_records
+      }
+    end
+
+    def build_extended_window
+      previous_records = VehicleKm.kept
+        .where(vehicle_id: @vehicle.id)
+        .where("input_date < ? OR (input_date = ? AND id < ?)",
+               @vehicle_km.input_date,
+               @vehicle_km.input_date,
+               @vehicle_km.id)
+        .order(input_date: :desc, id: :desc)
+        .limit(5)
+        .to_a
+
+      next_records = VehicleKm.kept
+        .where(vehicle_id: @vehicle.id)
+        .where("input_date > ? OR (input_date = ? AND id > ?)",
+               @vehicle_km.input_date,
+               @vehicle_km.input_date,
+               @vehicle_km.id)
+        .order(input_date: :asc, id: :asc)
+        .limit(5)
+        .to_a
+
+      (previous_records + [ @vehicle_km ] + next_records).uniq
+    end
+
+    def calculate_lis(ordered_records)
+      n = ordered_records.size
+      return [] if n == 0
+
+      dp = Array.new(n, 1)
+      parent = Array.new(n, -1)
+
+      (1...n).each do |i|
+        (0...i).each do |j|
+          if ordered_records[i].km_reported >= ordered_records[j].km_reported
+            if dp[j] + 1 > dp[i]
+              dp[i] = dp[j] + 1
+              parent[i] = j
+            end
+          end
+        end
+      end
+
+      max_length = dp.max
+      max_indices = dp.each_with_index.select { |len, _| len == max_length }.map(&:last)
+
+      max_index = if max_indices.size > 1
+        choose_best_sequence(max_indices, ordered_records, parent)
+      else
+        max_indices.first
+      end
+
+      sequence_indices = []
+      current = max_index
+
+      while current != -1
+        sequence_indices.unshift(current)
+        current = parent[current]
+      end
+
+      sequence_indices.map { |idx| ordered_records[idx].id }
+    end
+
+    def choose_best_sequence(candidate_indices, ordered_records, parent)
+      best_index = nil
+      best_score = -Float::INFINITY
+
+      candidate_indices.each do |end_index|
+        sequence = reconstruct_sequence(end_index, parent)
+        score = calculate_sequence_quality(sequence, ordered_records)
+
+        if score > best_score
+          best_score = score
+          best_index = end_index
+        end
+      end
+
+      best_index
+    end
+
+    def reconstruct_sequence(end_index, parent)
+      sequence = []
+      current = end_index
+
+      while current != -1
+        sequence.unshift(current)
+        current = parent[current]
+      end
+
+      sequence
+    end
+
+    def calculate_sequence_quality(sequence_indices, ordered_records)
+      score = 0
+
+      includes_new = sequence_indices.any? { |idx| ordered_records[idx].id == @vehicle_km.id }
+      score += 100 if includes_new
+
+      date_gaps = 0
+      sequence_indices.each_cons(2) do |i, j|
+        skipped = j - i - 1
+        date_gaps += skipped
+      end
+      score += (date_gaps * -10)
+
+      sequence_indices.each_cons(2) do |i, j|
+        km_diff = ordered_records[j].km_reported - ordered_records[i].km_reported
+        days_diff = (ordered_records[j].input_date - ordered_records[i].input_date).to_i
+
+        if days_diff > 0
+          daily_rate = km_diff.to_f / days_diff
+          score -= 3 if daily_rate > 300
+        end
+      end
+
+      score
+    end
+
+    def build_conflict_details(conflictive_ids, ordered_window)
+      conflictive_ids.map do |record_id|
+        record = ordered_window.find { |r| r.id == record_id }
+        next unless record
+
+        index = ordered_window.index(record)
+        prev_rec = index > 0 ? ordered_window[index - 1] : nil
+        next_rec = index < ordered_window.length - 1 ? ordered_window[index + 1] : nil
+
+        reasons = []
+
+        if prev_rec && record.km_reported < prev_rec.km_reported
+          reasons << "KM inferior al registro anterior (#{prev_rec.km_reported} km el #{prev_rec.input_date.strftime('%d/%m/%Y')})"
+        end
+
+        if next_rec && record.km_reported > next_rec.km_reported
+          reasons << "KM superior al registro posterior (#{next_rec.km_reported} km el #{next_rec.input_date.strftime('%d/%m/%Y')})"
+        end
+
+        if reasons.empty?
+          reasons << "No forma parte de la secuencia creciente más coherente"
+        end
+
+        {
+          record_id: record.id,
+          date: record.input_date,
+          km: record.km_reported,
+          reasons: reasons
+        }
+      end.compact
+    end
+
+    def empty_result
+      {
+        conflictive_ids: [],
+        valid_ids: [],
+        conflictive_records: []
+      }
+    end
+  end
+end
+# app/services/vehicle_kms/create_service.rb
+module VehicleKms
+  class CreateService
+    attr_reader :errors
+
+    def initialize(vehicle_id:, params:)
+      @vehicle_id = vehicle_id
+      @params = params
+      @errors = []
+    end
+
+    def call
+      validate_vehicle
+      return failure unless @errors.empty?
+
+      ActiveRecord::Base.transaction do
+        create_km_record
+        process_conflicts_and_corrections
+        update_vehicle_current_km
+        success
+      end
+    rescue StandardError => e
+      @errors << e.message
+      failure
+    end
+
+    private
+
+    def validate_vehicle
+      @vehicle = Vehicle.kept.find_by(id: @vehicle_id)
+      @errors << "Vehículo no encontrado" unless @vehicle
+    end
+
+    def create_km_record
+      # Construir los atributos correctamente
+      km_attributes = {
+        vehicle: @vehicle,
+        company: @vehicle.company,
+        input_date: @params[:input_date],
+        km_reported: @params[:km_reported],
+        km_normalized: @params[:km_reported],
+        status: "original"
+      }
+
+      # ✅ Agregar campos polimórficos si están presentes
+      if @params[:source_record_type] && @params[:source_record_id]
+        km_attributes[:source_record_type] = @params[:source_record_type]
+        km_attributes[:source_record_id] = @params[:source_record_id]
+      end
+
+      @vehicle_km = VehicleKm.create!(km_attributes)
+    end
+
+    def process_conflicts_and_corrections
+      detector = ConflictDetectorService.new(@vehicle_km)
+      result = detector.call
+
+      if result[:has_conflict]
+        # Procesar registros conflictivos
+        result[:conflictive_records].each do |conflict_info|
+          record = VehicleKm.find(conflict_info[:record_id])
+
+          corrector = KmCorrectionService.new(record)
+          correction_result = corrector.call
+
+          if correction_result[:success]
+            record.update!(
+              km_normalized: correction_result[:corrected_km],
+              status: "corregido",
+              conflict_reasons_list: conflict_info[:reasons],
+              correction_notes: correction_result[:notes]
+            )
+          else
+            record.update!(
+              km_normalized: record.km_reported,
+              status: "conflictivo",
+              conflict_reasons_list: conflict_info[:reasons],
+              correction_notes: correction_result[:notes]
+            )
+          end
+        end
+
+        # Restaurar registros que ahora son válidos
+        result[:valid_records].each do |valid_id|
+          record = VehicleKm.find(valid_id)
+
+          if %w[conflictivo corregido].include?(record.status)
+            record.update!(
+              km_normalized: record.km_reported,
+              status: "original",
+              conflict_reasons_list: [],
+              correction_notes: "Restaurado a secuencia válida tras nueva inserción"
+            )
+          end
+        end
+      else
+        @vehicle_km.update!(
+          km_normalized: @vehicle_km.km_reported,
+          status: "original",
+          conflict_reasons_list: []
+        )
+      end
+    end
+
+    def update_vehicle_current_km
+      latest = VehicleKm.kept
+        .where(vehicle_id: @vehicle_id)
+        .order(input_date: :desc, created_at: :desc)
+        .first
+
+      @vehicle.update!(current_km: latest.effective_km) if latest
+    end
+
+    def success
+      {
+        success: true,
+        vehicle_km: @vehicle_km,
+        status: @vehicle_km.status,
+        needs_review: @vehicle_km.needs_review?
+      }
+    end
+
+    def failure
+      { success: false, errors: @errors }
+    end
+  end
+end
+# app/services/vehicle_kms/delete_service.rb
+module VehicleKms
+  class DeleteService
+    attr_reader :errors
+
+    def initialize(vehicle_km_id:, discarded_by_id: nil)
+      @vehicle_km_id = vehicle_km_id
+      @errors = []
+    end
+
+    def call
+      validate_record
+      return failure unless @errors.empty?
+
+      ActiveRecord::Base.transaction do
+        @vehicle_id = @vehicle_km.vehicle_id
+        @input_date = @vehicle_km.input_date
+
+        soft_delete_record
+        handle_maintenance_relation
+        revalidate_and_correct_after_deletion
+        recalculate_vehicle_km
+        success
+      end
+    rescue StandardError => e
+      @errors << e.message
+      failure
+    end
+
+    private
+
+    def validate_record
+      @vehicle_km = VehicleKm.kept.find_by(id: @vehicle_km_id)
+      @errors << "Registro no encontrado" unless @vehicle_km
+    end
+
+    def soft_delete_record
+      @vehicle_km.update!(
+        discarded_at: Time.current,
+      )
+    end
+
+    def handle_maintenance_relation
+      # Buscar el mantenimiento correctamente
+      return unless @vehicle_km.from_maintenance?
+
+      # Buscar el mantenimiento que tiene este vehicle_km_id
+      maintenance = Maintenance.kept.find_by(vehicle_km_id: @vehicle_km.id)
+
+      return unless maintenance
+
+      # Guardar versión con PaperTrail
+      maintenance.paper_trail.save_with_version do
+        maintenance.touch
+      end
+
+      @maintenance_affected = maintenance
+    end
+
+    def revalidate_and_correct_after_deletion
+      window = build_window_around_deleted
+
+      window.each do |record|
+        detector = ConflictDetectorService.new(record)
+        result = detector.call
+
+        if result[:has_conflict]
+          result[:conflictive_records].each do |conflict_info|
+            rec = VehicleKm.find(conflict_info[:record_id])
+
+            corrector = KmCorrectionService.new(rec)
+            correction_result = corrector.call
+
+            if correction_result[:success]
+              rec.update!(
+                km_normalized: correction_result[:corrected_km],
+                status: "corregido",
+                conflict_reasons_list: conflict_info[:reasons],
+                correction_notes: correction_result[:notes]
+              )
+            else
+              rec.update!(
+                km_normalized: rec.km_reported,
+                status: "conflictivo",
+                conflict_reasons_list: conflict_info[:reasons],
+                correction_notes: correction_result[:notes]
+              )
+            end
+          end
+
+          result[:valid_records].each do |valid_id|
+            rec = VehicleKm.find(valid_id)
+            if %w[conflictivo corregido].include?(rec.status)
+              rec.update!(
+                km_normalized: rec.km_reported,
+                status: "original",
+                conflict_reasons_list: [],
+                correction_notes: "Restaurado tras eliminación de registro"
+              )
+            end
+          end
+        end
+      end
+    end
+
+    def build_window_around_deleted
+      previous_records = VehicleKm.kept
+        .where(vehicle_id: @vehicle_id)
+        .where("input_date < ?", @input_date)
+        .order(input_date: :desc, id: :desc)
+        .limit(5)
+        .to_a
+
+      next_records = VehicleKm.kept
+        .where(vehicle_id: @vehicle_id)
+        .where("input_date > ?", @input_date)
+        .order(input_date: :asc, id: :asc)
+        .limit(5)
+        .to_a
+
+      (previous_records + next_records).uniq
+    end
+
+    def recalculate_vehicle_km
+      latest = VehicleKm.kept
+        .where(vehicle_id: @vehicle_id)
+        .order(input_date: :desc, created_at: :desc)
+        .first
+
+      new_km = latest ? latest.effective_km : 0
+      Vehicle.find(@vehicle_id).update!(current_km: new_km)
+    end
+
+    def success
+      result = {
+        success: true,
+        vehicle_km: @vehicle_km,
+        message: "Registro de KM eliminado correctamente"
+      }
+
+      if @maintenance_affected
+        result[:maintenance_affected] = {
+          id: @maintenance_affected.id,
+          warning: "Este KM estaba asociado a un mantenimiento."
+        }
+      end
+
+      result
+    end
+
+    def failure
+      { success: false, errors: @errors }
+    end
+  end
+end
+# app/services/vehicle_kms/km_correction_service.rb
+#
+# Servicio para corregir registros conflictivos mediante interpolación/extrapolación
+# Usa solo los registros VÁLIDOS (no conflictivos) para calcular
+#
+module VehicleKms
+  class KmCorrectionService
+    def initialize(vehicle_km)
+      @vehicle_km = vehicle_km
+      @vehicle = vehicle_km.vehicle
+    end
+
+    def call
+      valid_neighbors = get_valid_neighbors
+      prev_valid = find_previous_valid(valid_neighbors)
+      next_valid = find_next_valid(valid_neighbors)
+
+      corrected_km = calculate_correction(prev_valid, next_valid, valid_neighbors)
+
+      if corrected_km
+        {
+          success: true,
+          corrected_km: corrected_km,
+          method: correction_method(prev_valid, next_valid),
+          notes: build_correction_notes(prev_valid, next_valid, corrected_km)
+        }
+      else
+        {
+          success: false,
+          corrected_km: nil,
+          method: nil,
+          notes: "No se pudo calcular corrección - faltan registros válidos"
+        }
+      end
+    end
+
+    private
+
+    def get_valid_neighbors
+      VehicleKm.kept
+        .where(vehicle_id: @vehicle.id)
+        .where.not(status: "conflictivo")
+        .where.not(id: @vehicle_km.id)
+        .order(input_date: :asc, id: :asc)
+        .to_a
+    end
+
+    def find_previous_valid(valid_neighbors)
+      valid_neighbors
+        .select { |r| r.input_date < @vehicle_km.input_date ||
+                      (r.input_date == @vehicle_km.input_date && r.id < @vehicle_km.id) }
+        .last
+    end
+
+    def find_next_valid(valid_neighbors)
+      valid_neighbors
+        .select { |r| r.input_date > @vehicle_km.input_date ||
+                      (r.input_date == @vehicle_km.input_date && r.id > @vehicle_km.id) }
+        .first
+    end
+
+    def calculate_correction(prev_valid, next_valid, all_valid)
+      if prev_valid && next_valid
+        interpolate(prev_valid, next_valid)
+      elsif prev_valid
+        extrapolate_forward(prev_valid, all_valid)
+      elsif next_valid
+        extrapolate_backward(next_valid, all_valid)
+      else
+        nil
+      end
+    end
+
+    def interpolate(prev_valid, next_valid)
+      days_total = (next_valid.input_date - prev_valid.input_date).to_i
+      return nil if days_total <= 0
+
+      days_from_prev = (@vehicle_km.input_date - prev_valid.input_date).to_i
+      return nil if days_from_prev < 0
+
+      km_prev = prev_valid.km_normalized || prev_valid.km_reported
+      km_next = next_valid.km_normalized || next_valid.km_reported
+
+      km_total = km_next - km_prev
+      return nil if km_total < 0
+
+      km_per_day = km_total.to_f / days_total
+
+      (km_prev + (km_per_day * days_from_prev)).round
+    end
+
+    def extrapolate_forward(prev_valid, all_valid)
+      avg_daily_rate = calculate_historical_rate(all_valid, before: @vehicle_km.input_date)
+      return nil if avg_daily_rate <= 0
+
+      days_diff = (@vehicle_km.input_date - prev_valid.input_date).to_i
+      return nil if days_diff <= 0
+
+      km_prev = prev_valid.km_normalized || prev_valid.km_reported
+      estimated_km = (km_prev + (avg_daily_rate * days_diff)).round
+
+      estimated_km > km_prev ? estimated_km : nil
+    end
+
+    def extrapolate_backward(next_valid, all_valid)
+      avg_daily_rate = calculate_historical_rate(all_valid, after: @vehicle_km.input_date)
+      return nil if avg_daily_rate <= 0
+
+      days_diff = (next_valid.input_date - @vehicle_km.input_date).to_i
+      return nil if days_diff <= 0
+
+      km_next = next_valid.km_normalized || next_valid.km_reported
+      estimated_km = (km_next - (avg_daily_rate * days_diff)).round
+
+      (estimated_km < km_next && estimated_km >= 0) ? estimated_km : nil
+    end
+
+    def calculate_historical_rate(valid_records, before: nil, after: nil)
+      relevant_records = if before
+        valid_records.select { |r| r.input_date < before }
+      elsif after
+        valid_records.select { |r| r.input_date > after }
+      else
+        valid_records
+      end
+
+      return 50.0 if relevant_records.count < 2
+
+      sample = relevant_records.last(10)
+      return 50.0 if sample.count < 2
+
+      first_record = sample.first
+      last_record = sample.last
+
+      km_first = first_record.km_normalized || first_record.km_reported
+      km_last = last_record.km_normalized || last_record.km_reported
+
+      total_km = km_last - km_first
+      total_days = (last_record.input_date - first_record.input_date).to_i
+
+      return 50.0 if total_days <= 0 || total_km <= 0
+
+      (total_km.to_f / total_days).round(2)
+    end
+
+    def correction_method(prev_valid, next_valid)
+      if prev_valid && next_valid
+        "interpolation"
+      elsif prev_valid
+        "extrapolation_forward"
+      elsif next_valid
+        "extrapolation_backward"
+      else
+        "none"
+      end
+    end
+
+    def build_correction_notes(prev_valid, next_valid, corrected_km)
+      notes = []
+
+      if prev_valid && next_valid
+        notes << "Interpolación lineal entre #{prev_valid.input_date.strftime('%d/%m/%Y')} (#{prev_valid.km_normalized || prev_valid.km_reported} km)"
+        notes << "y #{next_valid.input_date.strftime('%d/%m/%Y')} (#{next_valid.km_normalized || next_valid.km_reported} km)"
+      elsif prev_valid
+        notes << "Extrapolación forward desde #{prev_valid.input_date.strftime('%d/%m/%Y')} (#{prev_valid.km_normalized || prev_valid.km_reported} km)"
+        notes << "usando tendencia histórica"
+      elsif next_valid
+        notes << "Extrapolación backward desde #{next_valid.input_date.strftime('%d/%m/%Y')} (#{next_valid.km_normalized || next_valid.km_reported} km)"
+        notes << "usando tendencia histórica"
+      end
+
+      notes << "KM reportado: #{@vehicle_km.km_reported}, KM corregido: #{corrected_km}"
+      notes.join(". ")
+    end
+  end
+end
+# app/services/vehicle_kms/update_service.rb
+module VehicleKms
+  class UpdateService
+    attr_reader :errors
+
+    def initialize(vehicle_km_id:, params:)
+      @vehicle_km_id = vehicle_km_id
+      @params = params
+      @errors = []
+    end
+
+    def call
+      validate_record
+      return failure unless @errors.empty?
+
+      ActiveRecord::Base.transaction do
+        update_km_record
+        revalidate_and_correct_window
+        update_vehicle_current_km
+        success
+      end
+    rescue StandardError => e
+      @errors << e.message
+      failure
+    end
+
+    private
+
+    def validate_record
+      @vehicle_km = VehicleKm.kept.find_by(id: @vehicle_km_id)
+      @errors << "Registro no encontrado" unless @vehicle_km
+    end
+
+    def update_km_record
+      old_km = @vehicle_km.km_normalized || @vehicle_km.km_reported
+
+      # Si se está resolviendo un conflicto manualmente
+      if @params[:resolve_conflict] && @vehicle_km.status == "conflictivo"
+        new_km = @params[:km_normalized] || @params[:km_reported] || @vehicle_km.km_reported
+
+        @vehicle_km.update!(
+          km_normalized: new_km,
+          status: "editado",
+          conflict_reasons_list: [],
+          correction_notes: @params[:correction_notes] || "Resuelto manualmente. KM anterior: #{old_km}"
+        )
+      else
+        # Actualización normal
+        update_attrs = {}
+
+        if @params[:km_normalized] || @params[:km_reported]
+          new_km = @params[:km_normalized] || @params[:km_reported]
+          update_attrs[:km_reported] = new_km
+          update_attrs[:km_normalized] = new_km
+          update_attrs[:status] = "editado"
+          update_attrs[:correction_notes] = @params[:correction_notes] || "Editado manualmente. KM anterior: #{old_km}"
+        end
+
+        if @params[:status]
+          update_attrs[:status] = @params[:status]
+        end
+
+        if @params[:correction_notes] && update_attrs[:correction_notes].nil?
+          update_attrs[:correction_notes] = @params[:correction_notes]
+        end
+
+        @vehicle_km.update!(update_attrs) if update_attrs.any?
+      end
+    end
+
+    def revalidate_and_correct_window
+      # Solo revalidar si se cambió el kilometraje
+      return unless @params[:km_normalized] || @params[:km_reported]
+
+      detector = ConflictDetectorService.new(@vehicle_km)
+      result = detector.call
+
+      if result[:has_conflict]
+        result[:conflictive_records].each do |conflict_info|
+          record = VehicleKm.find(conflict_info[:record_id])
+
+          if record.id == @vehicle_km.id
+            # El registro editado sigue siendo conflictivo
+            record.update!(
+              status: "editado",
+              conflict_reasons_list: conflict_info[:reasons],
+              correction_notes: @vehicle_km.correction_notes + " | Conflictivo tras edición"
+            )
+          else
+            corrector = KmCorrectionService.new(record)
+            correction_result = corrector.call
+
+            if correction_result[:success]
+              record.update!(
+                km_normalized: correction_result[:corrected_km],
+                status: "corregido",
+                conflict_reasons_list: conflict_info[:reasons],
+                correction_notes: correction_result[:notes]
+              )
+            else
+              record.update!(
+                km_normalized: record.km_reported,
+                status: "conflictivo",
+                conflict_reasons_list: conflict_info[:reasons],
+                correction_notes: correction_result[:notes]
+              )
+            end
+          end
+        end
+
+        result[:valid_records].each do |valid_id|
+          record = VehicleKm.find(valid_id)
+          next if record.id == @vehicle_km.id
+
+          if %w[conflictivo corregido].include?(record.status)
+            record.update!(
+              km_normalized: record.km_reported,
+              status: "original",
+              conflict_reasons_list: [],
+              correction_notes: "Restaurado tras edición de registro vecino"
+            )
+          end
+        end
+      end
+    end
+
+    def update_vehicle_current_km
+      latest = VehicleKm.kept
+        .where(vehicle_id: @vehicle_km.vehicle_id)
+        .order(input_date: :desc, created_at: :desc)
+        .first
+
+      @vehicle_km.vehicle.update!(current_km: latest.effective_km) if latest
+    end
+
+    def success
+      { success: true, vehicle_km: @vehicle_km }
+    end
+
+    def failure
+      { success: false, errors: @errors }
+    end
+  end
+end

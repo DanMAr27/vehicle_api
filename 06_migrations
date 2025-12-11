@@ -1,0 +1,118 @@
+class CreateVersions < ActiveRecord::Migration[8.0]
+  TEXT_BYTES = 1_073_741_823
+
+  def change
+    create_table :versions do |t|
+      t.string   :whodunnit
+      t.datetime :created_at
+      t.bigint   :item_id,   null: false
+      t.string   :item_type, null: false
+      t.string   :event,     null: false
+      t.text     :object, limit: TEXT_BYTES
+    end
+    add_index :versions, %i[item_type item_id]
+  end
+end
+# db/migrate/XXXXXX_create_companies.rb
+class CreateCompanies < ActiveRecord::Migration[7.0]
+  def change
+    create_table :companies do |t|
+      t.string :name, null: false
+      t.string :cif
+      t.datetime :discarded_at
+      t.integer :max_daily_km_tolerance
+      t.timestamps
+    end
+
+    add_index :companies, :discarded_at
+  end
+end
+# db/migrate/XXXXXX_create_vehicles.rb
+class CreateVehicles < ActiveRecord::Migration[7.0]
+  def change
+    create_table :vehicles do |t|
+      t.string :matricula, null: false
+      t.string :vin
+      t.integer :current_km, default: 0
+      t.references :company, null: false, foreign_key: true
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :vehicles, :matricula
+    add_index :vehicles, :vin
+    add_index :vehicles, :discarded_at
+  end
+end
+# db/migrate/XXXXXX_create_vehicle_kms.rb
+class CreateVehicleKms < ActiveRecord::Migration[7.0]
+  def change
+    create_table :vehicle_kms do |t|
+      t.date :input_date, null: false
+      t.references :source_record, polymorphic: true, null: true
+      t.integer :km_reported, null: false
+      t.integer :km_normalized
+      t.string :status, default: 'original', null: false # original/estimado/editado
+      t.text :correction_notes
+      t.text :conflict_reasons # JSON array de razones del conflicto
+      t.references :vehicle, null: false, foreign_key: true
+      t.references :company, null: false, foreign_key: true
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :vehicle_kms, [ :vehicle_id, :input_date ]
+    add_index :vehicle_kms, [ :source_record_type, :source_record_id ]
+    add_index :vehicle_kms, :status
+    add_index :vehicle_kms, :discarded_at
+  end
+end
+# db/migrate/XXXXXX_create_maintenances.rb
+class CreateMaintenances < ActiveRecord::Migration[7.0]
+  def change
+    create_table :maintenances do |t|
+      t.date :maintenance_date, null: false
+      t.integer :register_km, null: false
+      t.decimal :amount, precision: 10, scale: 2
+      t.text :description
+      t.references :vehicle, null: false, foreign_key: true
+      t.references :company, null: false, foreign_key: true
+      t.references :vehicle_km, foreign_key: true # Relación con el registro KM
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :maintenances, :maintenance_date
+    add_index :maintenances, :discarded_at
+  end
+end
+# db/migrate/XXXXXX_create_soft_delete_audit_logs.rb
+class CreateSoftDeleteAuditLogs < ActiveRecord::Migration[7.0]
+  def change
+    create_table :soft_delete_audit_logs do |t|
+      t.references :record, polymorphic: true, null: false, index: true
+      t.string :action, null: false, limit: 20 # Valores: 'delete' o 'restore'
+      t.references :performed_by, polymorphic: true, null: true
+      t.jsonb :context, default: {}, null: false
+      t.integer :cascade_count, default: 0, null: false # Número de registros borrados en cascada
+      t.integer :nullify_count, default: 0, null: false # Número de registros desvinculados (FK = NULL)
+      t.boolean :can_restore, default: true, null: false # ¿Se puede restaurar este registro?
+      t.string :restore_complexity, limit: 20       # Complejidad de restauración: 'simple', 'medium', 'complex'
+      t.datetime :performed_at, null: false
+      t.timestamps
+    end
+    add_index :soft_delete_audit_logs, :action
+     add_index :soft_delete_audit_logs, :performed_at
+    add_index :soft_delete_audit_logs, :can_restore
+    add_index :soft_delete_audit_logs,
+              [ :record_type, :action, :performed_at ],
+              name: 'index_audit_logs_on_record_type_action_date'
+    add_index :soft_delete_audit_logs,
+              [ :performed_by_type, :performed_by_id, :performed_at ],
+              name: 'index_audit_logs_on_user_date'
+    add_index :soft_delete_audit_logs,
+              :cascade_count,
+              where: 'cascade_count > 10',
+              name: 'index_audit_logs_on_high_cascade'
+  end
+end

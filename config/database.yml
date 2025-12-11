@@ -1,0 +1,30 @@
+# config/database.yml
+
+default: &default
+  adapter: postgresql
+  encoding: unicode
+  # Pool de conexiones: cuántas conexiones inactivas debe mantener Rails
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+
+development:
+  # Hereda las configuraciones comunes definidas en 'default'
+  <<: *default
+  database: vehicles_api_development
+  # Reemplaza 'tu_usuario' con tu usuario de PostgreSQL (ej: postgres, o tu usuario de sistema)
+  username: postgres
+  # Reemplaza 'tu_contraseña' si tienes una configurada para tu usuario
+  password: postgres
+  host: localhost
+
+test:
+  <<: *default
+  database: vehicles_api_test
+  username: postgres
+  password: postgres
+  host: localhost
+
+production:
+  # En producción, es altamente recomendado usar variables de entorno
+  # para la URL de conexión, por seguridad.
+  <<: *default
+  url: <%= ENV['DATABASE_URL'] %>
