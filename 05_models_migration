@@ -1,0 +1,453 @@
+# This migration creates the `versions` table, the only schema PT requires.
+# All other migrations PT provides are optional.
+class CreateVersions < ActiveRecord::Migration[8.0]
+  # The largest text column available in all supported RDBMS is
+  # 1024^3 - 1 bytes, roughly one gibibyte.  We specify a size
+  # so that MySQL will use `longtext` instead of `text`.  Otherwise,
+  # when serializing very large objects, `text` might not be big enough.
+  TEXT_BYTES = 1_073_741_823
+
+  def change
+    create_table :versions do |t|
+      # Consider using bigint type for performance if you are going to store only numeric ids.
+      # t.bigint   :whodunnit
+      t.string   :whodunnit
+
+      # Known issue in MySQL: fractional second precision
+      # -------------------------------------------------
+      #
+      # MySQL timestamp columns do not support fractional seconds unless
+      # defined with "fractional seconds precision". MySQL users should manually
+      # add fractional seconds precision to this migration, specifically, to
+      # the `created_at` column.
+      # (https://dev.mysql.com/doc/refman/5.6/en/fractional-seconds.html)
+      #
+      # MySQL users should also upgrade to at least rails 4.2, which is the first
+      # version of ActiveRecord with support for fractional seconds in MySQL.
+      # (https://github.com/rails/rails/pull/14359)
+      #
+      # MySQL users should use the following line for `created_at`
+      # t.datetime :created_at, limit: 6
+      t.datetime :created_at
+
+      t.bigint   :item_id,   null: false
+      t.string   :item_type, null: false
+      t.string   :event,     null: false
+      t.text     :object, limit: TEXT_BYTES
+    end
+    add_index :versions, %i[item_type item_id]
+  end
+end
+
+# db/migrate/XXXXXX_create_companies.rb
+class CreateCompanies < ActiveRecord::Migration[7.0]
+  def change
+    create_table :companies do |t|
+      t.string :name, null: false
+      t.string :cif
+      t.datetime :discarded_at
+      t.integer :max_daily_km_tolerance
+      t.timestamps
+    end
+
+    add_index :companies, :discarded_at
+  end
+end
+
+# db/migrate/XXXXXX_create_vehicles.rb
+class CreateVehicles < ActiveRecord::Migration[7.0]
+  def change
+    create_table :vehicles do |t|
+      t.string :matricula, null: false
+      t.string :vin
+      t.integer :current_km, default: 0
+      t.references :company, null: false, foreign_key: true
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :vehicles, :matricula
+    add_index :vehicles, :vin
+    add_index :vehicles, :discarded_at
+  end
+end
+
+# db/migrate/XXXXXX_create_vehicle_kms.rb
+class CreateVehicleKms < ActiveRecord::Migration[7.0]
+  def change
+    create_table :vehicle_kms do |t|
+      t.date :input_date, null: false
+      t.references :source_record, polymorphic: true, null: true
+      t.integer :km_reported, null: false
+      t.integer :km_normalized
+      t.string :status, default: 'original', null: false # original/estimado/editado
+      t.text :correction_notes
+      t.text :conflict_reasons # JSON array de razones del conflicto
+      t.references :vehicle, null: false, foreign_key: true
+      t.references :company, null: false, foreign_key: true
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :vehicle_kms, [ :vehicle_id, :input_date ]
+    add_index :vehicle_kms, [ :source_record_type, :source_record_id ]
+    add_index :vehicle_kms, :status
+    add_index :vehicle_kms, :discarded_at
+  end
+end
+
+# db/migrate/XXXXXX_create_maintenances.rb
+class CreateMaintenances < ActiveRecord::Migration[7.0]
+  def change
+    create_table :maintenances do |t|
+      t.date :maintenance_date, null: false
+      t.integer :register_km, null: false
+      t.decimal :amount, precision: 10, scale: 2
+      t.text :description
+      t.references :vehicle, null: false, foreign_key: true
+      t.references :company, null: false, foreign_key: true
+      t.references :vehicle_km, foreign_key: true # Relación con el registro KM
+      t.datetime :discarded_at
+      t.timestamps
+    end
+
+    add_index :maintenances, :maintenance_date
+    add_index :maintenances, :discarded_at
+  end
+end
+# app/models/company.rb
+
+class Company < ApplicationRecord
+  include Discard::Model
+
+  # Relaciones
+  has_many :vehicles, dependent: :destroy
+  has_many :vehicle_kms, dependent: :destroy
+  has_many :maintenances, dependent: :destroy
+
+  # PaperTrail para auditoría
+  has_paper_trail
+
+  # Validaciones
+  validates :name, presence: true
+
+  # Scopes
+  scope :with_auto_correction, -> { where(auto_correction_enabled: true) }
+  scope :without_auto_correction, -> { where(auto_correction_enabled: false) }
+
+  # MÉTODOS PÚBLICOS
+
+  # Verificar si la corrección automática está habilitada
+  def auto_correction_enabled?
+    auto_correction_enabled == true
+  end
+
+  # Obtener tolerancia de KM diarios (si existe)
+  def daily_km_tolerance
+    max_daily_km_tolerance || Float::INFINITY
+  end
+
+  # Verificar si un salto de KM excede la tolerancia
+  def exceeds_daily_tolerance?(km_diff, days_diff)
+    return false if max_daily_km_tolerance.nil?
+    return false if days_diff.zero?
+
+    daily_rate = km_diff.to_f / days_diff
+    daily_rate > max_daily_km_tolerance
+  end
+
+  # Estadísticas de KM de todos los vehículos
+  def km_stats
+    {
+      total_vehicles: vehicles.kept.count,
+      total_km_records: vehicle_kms.kept.count,
+      conflictive_records: vehicle_kms.kept.conflictive.count,
+      manual_records: vehicle_kms.kept.manual.count,
+      maintenance_records: vehicle_kms.kept.from_maintenance.count,
+      vehicles_with_conflicts: vehicles.with_conflictive_kms.count,
+      by_status: vehicle_kms.kept.group(:status).count
+    }
+  end
+end
+# app/models/maintenance.rb
+
+class Maintenance < ApplicationRecord
+  include Discard::Model
+  has_paper_trail
+
+  # Relaciones
+  belongs_to :vehicle
+  belongs_to :company
+  has_one :vehicle_km, as: :source_record, dependent: :nullify
+
+  # Validaciones
+  validates :maintenance_date, presence: true
+  validates :register_km, presence: true, numericality: { greater_than_or_equal_to: 0 }
+  validates :amount, numericality: { greater_than_or_equal_to: 0, allow_nil: true }
+
+  # Scopes
+  scope :kept, -> { where(discarded_at: nil) }
+  scope :ordered, -> { order(maintenance_date: :desc) }
+  scope :with_km, -> { joins(:vehicle_km) }
+  scope :without_km, -> { left_joins(:vehicle_km).where(vehicle_kms: { id: nil }) }
+  scope :with_km_issues, -> {
+    left_joins(:vehicle_km)
+      .where("vehicle_kms.status = ? OR vehicle_kms.id IS NULL", "conflictivo")
+  }
+
+  # MÉTODOS PÚBLICOS
+  # Estado del registro de KM asociado
+  def km_status
+    return "sin_registro" if vehicle_km.nil?
+    return "eliminado" if vehicle_km.discarded?
+    "activo"
+  end
+
+  # ¿El KM fue informado manualmente en el mantenimiento?
+  def km_manually_reported?
+    vehicle_km.present? && vehicle_km.from_maintenance?
+  end
+
+  # ¿El KM está desincronizado con el registro actual?
+  def km_desynchronized?
+    return false if vehicle_km.nil?
+    register_km != vehicle_km.effective_km
+  end
+
+  # Diferencia entre KM del mantenimiento y KM efectivo del registro
+  def km_difference
+    return 0 if vehicle_km.nil?
+    register_km - vehicle_km.effective_km
+  end
+
+  # ¿El KM está en conflicto?
+  def km_conflictive?
+    vehicle_km.present? && vehicle_km.needs_review?
+  end
+
+  # ¿El KM fue corregido automáticamente?
+  def km_auto_corrected?
+    vehicle_km.present? && vehicle_km.auto_corrected?
+  end
+end
+
+# app/models/vehicle_km.rb
+class VehicleKm < ApplicationRecord
+  include Discard::Model
+  has_paper_trail
+
+  # Relaciones
+  belongs_to :vehicle
+  belongs_to :company
+  belongs_to :source_record, polymorphic: true, optional: true
+
+  # Estados válidos (sin 'estimado')
+  VALID_STATUSES = %w[original corregido editado conflictivo].freeze
+
+  # Validaciones
+  validates :status, inclusion: { in: VALID_STATUSES }
+  validates :input_date, presence: true
+  validates :km_reported, presence: true, numericality: { greater_than_or_equal_to: 0 }
+  validates :km_normalized, numericality: { greater_than_or_equal_to: 0, allow_nil: true }
+
+  # Validación condicional del source_record polimórfico
+  validates :source_record_type, presence: true, if: -> { source_record_id.present? }
+  validates :source_record_id, presence: true, if: -> { source_record_type.present? }
+
+  # Scopes
+  scope :ordered, -> { order(input_date: :desc, created_at: :desc) }
+  scope :by_status, ->(status) { where(status: status) }
+  scope :conflictive, -> { where(status: "conflictivo") }
+  scope :needs_review, -> { conflictive }
+  scope :corrected, -> { where(status: "corregido") }
+  scope :original, -> { where(status: "original") }
+  scope :by_vehicle, ->(vehicle_id) { where(vehicle_id: vehicle_id) }
+  scope :by_source_type, ->(type) { where(source_record_type: type) }
+  scope :from_maintenance, -> { where(source_record_type: "Maintenance") }
+  scope :manual, -> { where(source_record_type: nil) }
+  scope :in_date_range, ->(from, to) { where(input_date: from..to) }
+
+  # Callbacks
+  after_commit :update_vehicle_stats, on: [ :create, :update, :destroy ]
+
+  # MÉTODOS PÚBLICOS
+  # Método para obtener el KM efectivo
+  def effective_km
+    km_normalized || km_reported
+  end
+
+  # Método para obtener las razones de conflicto como array
+  def conflict_reasons_list
+    return [] if conflict_reasons.blank?
+    JSON.parse(conflict_reasons)
+  rescue JSON::ParserError
+    []
+  end
+
+  # Setter para guardar las razones de conflicto como JSON
+  def conflict_reasons_list=(reasons)
+    self.conflict_reasons = reasons.to_json
+  end
+
+  # Método mejorado para obtener el mantenimiento asociado
+  # Usa la relación inversa (Maintenance.vehicle_km_id) en lugar de source_record
+  def maintenance
+    return nil unless from_maintenance?
+    return @maintenance if defined?(@maintenance)
+
+    # Buscar por la relación inversa primero (más confiable)
+    @maintenance = Maintenance.kept.find_by(vehicle_km_id: id)
+
+    # Si no se encuentra y tenemos source_record_id, intentar por ahí
+    @maintenance ||= source_record if source_record.is_a?(Maintenance)
+
+    @maintenance
+  end
+
+  # Método alternativo que usa source_record directamente
+  def source_maintenance
+    source_record if source_record_type == "Maintenance"
+  end
+
+  # Verificar origen del registro
+  def from_maintenance?
+    source_record_type == "Maintenance"
+  end
+
+  def manually_created?
+    source_record.nil?
+  end
+
+  # Estados y verificaciones
+  def needs_review?
+    status == "conflictivo"
+  end
+
+  def auto_corrected?
+    status == "corregido"
+  end
+
+  def manually_edited?
+    status == "editado"
+  end
+
+  # Cálculos de diferencias
+  def correction_difference
+    return 0 if km_normalized.nil?
+    km_normalized - km_reported
+  end
+
+  def correction_percentage
+    return 0 if km_reported.zero? || km_normalized.nil?
+    ((correction_difference.to_f / km_reported) * 100).round(2)
+  end
+
+  # Información del origen con más detalles
+  def source_description
+    if manually_created?
+      "Manual"
+    elsif from_maintenance?
+      maint = maintenance
+      if maint
+        "Mantenimiento ##{maint.id} (#{maint.maintenance_date.strftime('%d/%m/%Y')})"
+      else
+        "Mantenimiento ##{source_record_id} (registro eliminado)"
+      end
+    else
+      "Desconocido"
+    end
+  end
+
+  # Verificar si el mantenimiento asociado existe
+  def maintenance_exists?
+    from_maintenance? && maintenance.present?
+  end
+
+  # Verificar si el mantenimiento fue eliminado
+  def maintenance_deleted?
+    from_maintenance? && maintenance.nil?
+  end
+
+  private
+
+  def update_vehicle_stats
+    return unless vehicle.respond_to?(:total_km_records)
+
+    vehicle.update_columns(
+      total_km_records: vehicle.vehicle_kms.kept.count,
+      conflictive_km_records: vehicle.vehicle_kms.kept.conflictive.count,
+      last_km_update_at: Time.current
+    )
+  end
+end
+
+# app/models/vehicle.rb
+class Vehicle < ApplicationRecord
+  include Discard::Model
+  has_paper_trail
+
+  # Relaciones
+  belongs_to :company
+  has_many :vehicle_kms, dependent: :destroy
+  has_many :maintenances, dependent: :destroy
+
+  # Validaciones
+  validates :matricula, presence: true, uniqueness: { scope: :company_id }
+  validates :current_km, numericality: { greater_than_or_equal_to: 0 }
+
+  # Scopes
+  scope :with_conflictive_kms, -> {
+    joins(:vehicle_kms)
+      .where(vehicle_kms: { status: "conflictivo", discarded_at: nil })
+      .distinct
+  }
+  scope :ordered, -> { order(matricula: :asc) }
+
+  # MÉTODOS PÚBLICOS
+
+  # Obtener último registro de KM válido
+  def latest_km_record
+    vehicle_kms.kept.ordered.first
+  end
+
+  # Obtener KM actual efectivo (del último registro)
+  def effective_current_km
+    latest_km_record&.effective_km || current_km
+  end
+
+  # Verificar si tiene registros conflictivos
+  def has_conflictive_kms?
+    if respond_to?(:conflictive_km_records)
+      conflictive_km_records > 0
+    else
+      vehicle_kms.kept.conflictive.exists?
+    end
+  end
+
+  # Contar registros por estado
+  def km_records_by_status
+    vehicle_kms.kept.group(:status).count
+  end
+
+  # Estadísticas de KM
+  def km_stats
+    kms = vehicle_kms.kept
+    {
+      total: kms.count,
+      original: kms.original.count,
+      corrected: kms.corrected.count,
+      conflictive: kms.conflictive.count,
+      manual: kms.manual.count,
+      from_maintenance: kms.from_maintenance.count,
+      date_range: {
+        oldest: kms.minimum(:input_date),
+        newest: kms.maximum(:input_date)
+      },
+      km_range: {
+        min: kms.minimum(:km_reported),
+        max: kms.maximum(:km_reported),
+        current: current_km
+      }
+    }
+  end
+end

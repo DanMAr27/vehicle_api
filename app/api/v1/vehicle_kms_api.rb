@@ -1,0 +1,477 @@
+# app/api/v1/vehicle_kms_api.rb
+module V1
+  class VehicleKmsApi < Grape::API
+    resource :vehicle_kms do
+      desc "Lista registros de KM"
+      params do
+        optional :vehicle_id, type: Integer, desc: "Filtrar por vehículo"
+        optional :status, type: String, values: %w[original corregido editado conflictivo], desc: "Filtrar por estado"
+        optional :source_type, type: String, values: %w[manual Maintenance], desc: "Filtrar por tipo de origen"
+        optional :needs_review, type: Boolean, desc: "Solo registros que requieren revisión (conflictivos)"
+        optional :from_date, type: Date, desc: "Fecha desde"
+        optional :to_date, type: Date, desc: "Fecha hasta"
+        optional :include_vehicle, type: Boolean, default: false, desc: "Incluir datos del vehículo"
+        optional :include_source, type: Boolean, default: false, desc: "Incluir datos del registro origen"
+        optional :include_deleted, type: Boolean, default: false, desc: "Incluir registros eliminados"
+        optional :page, type: Integer, default: 1
+        optional :per_page, type: Integer, default: 25
+      end
+      get do
+        # Base query: kept por defecto, o with_discarded si se pide
+        kms = if params[:include_deleted]
+                VehicleKm.with_discarded.includes(:vehicle, :company, :source_record)
+        else
+                VehicleKm.kept.includes(:vehicle, :company, :source_record)
+        end
+
+        kms = kms.where(vehicle_id: params[:vehicle_id]) if params[:vehicle_id]
+        kms = kms.where(status: params[:status]) if params[:status]
+        kms = kms.where(status: "conflictivo") if params[:needs_review]
+
+        # Filtrar por tipo de origen
+        if params[:source_type]
+          if params[:source_type] == "manual"
+            kms = kms.manual
+          else
+            kms = kms.where(source_record_type: params[:source_type])
+          end
+        end
+
+        if params[:from_date] && params[:to_date]
+          kms = kms.where(input_date: params[:from_date]..params[:to_date])
+        end
+
+        kms = kms.order(input_date: :desc, created_at: :desc)
+                 .page(params[:page])
+                 .per(params[:per_page])
+
+        present kms, with: Entities::VehicleKmEntity,
+                include_vehicle: params[:include_vehicle],
+                include_source: params[:include_source]
+      end
+
+      desc "Obtener un registro de KM específico con detalles"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+        optional :include_deleted, type: Boolean, default: false
+      end
+      route_param :id do
+        get do
+          km = if params[:include_deleted]
+                 VehicleKm.with_discarded.includes(:source_record).find(params[:id])
+          else
+                 VehicleKm.kept.includes(:source_record).find(params[:id])
+          end
+
+          present km, with: Entities::VehicleKmDetailEntity
+        end
+      end
+
+      desc "Crear un nuevo registro de KM manual"
+      params do
+        requires :vehicle_id, type: Integer, desc: "ID del vehículo"
+        requires :input_date, type: Date, desc: "Fecha del registro"
+        requires :km_reported, type: Integer, desc: "Kilómetros reportados"
+        optional :notes, type: String, desc: "Notas adicionales"
+      end
+      post do
+        result = VehicleKms::CreateService.new(
+          vehicle_id: params[:vehicle_id],
+          params: {
+            input_date: params[:input_date],
+            km_reported: params[:km_reported]
+          }
+        ).call
+
+        if result[:success]
+          response_data = {
+            success: true,
+            vehicle_km: present(result[:vehicle_km], with: Entities::VehicleKmDetailEntity),
+            status: result[:status],
+            needs_review: result[:needs_review]
+          }
+
+          if result[:needs_review]
+            response_data[:warning] = "El registro fue marcado como conflictivo y requiere revisión manual"
+          end
+
+          response_data
+        else
+          error!({ success: false, errors: result[:errors] }, 422)
+        end
+      end
+
+      desc "Actualizar un registro de KM manualmente"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+        optional :km_normalized, type: Integer, desc: "Kilómetros normalizados (corrección manual)"
+        optional :km_reported, type: Integer, desc: "Kilómetros reportados"
+        optional :status, type: String, values: %w[original corregido editado conflictivo], desc: "Cambiar estado manualmente"
+        optional :correction_notes, type: String, desc: "Notas de la corrección manual"
+        optional :resolve_conflict, type: Boolean, default: false, desc: "Resolver conflicto manualmente"
+      end
+      route_param :id do
+        put do
+          result = VehicleKms::UpdateService.new(
+            vehicle_km_id: params[:id],
+            params: params.slice(:km_normalized, :km_reported, :status, :correction_notes, :resolve_conflict)
+          ).call
+
+          if result[:success]
+            present result[:vehicle_km], with: Entities::VehicleKmDetailEntity
+          else
+            error!({ success: false, errors: result[:errors] }, 422)
+          end
+        end
+      end
+
+      desc "Eliminar un registro de KM (soft delete con análisis de impacto)"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+        optional :force, type: Boolean, default: false, desc: "Forzar eliminación ignorando advertencias"
+        optional :preview, type: Boolean, default: false, desc: "Solo mostrar el impacto sin ejecutar"
+      end
+      route_param :id do
+        delete do
+          vehicle_km = VehicleKm.kept.find(params[:id])
+
+          # Crear coordinador
+          coordinator = SoftDelete::DeletionCoordinator.new(vehicle_km,
+            force: params[:force]
+          )
+
+          # Si se pide preview, solo analizar
+          if params[:preview]
+            preview = coordinator.preview
+            return present({
+              success: true,
+              preview: preview,
+              vehicle_km_id: vehicle_km.id
+            })
+          end
+
+          # Ejecutar borrado
+          result = coordinator.call
+
+          if result[:success]
+            present({
+              success: true,
+              message: result[:message],
+              vehicle_km_id: vehicle_km.id,
+              impact: {
+                nullify_count: result[:nullify_count]
+              },
+              warnings: result[:warnings],
+              maintenance_affected: result[:audit_log]&.context&.dig("maintenance_id")
+            })
+          else
+            error!({
+              success: false,
+              errors: result[:errors],
+              warnings: result[:warnings],
+              message: result[:message],
+              requires_force: result[:requires_force],
+              impact: result[:impact]
+            }, 422)
+          end
+        end
+      end
+
+      desc "Restaurar un registro de KM eliminado"
+      params do
+        requires :id, type: Integer, desc: "ID del registro eliminado"
+        optional :reassign_to, type: Hash, desc: "Reasignar a otro vehículo si el original fue eliminado"
+        optional :preview, type: Boolean, default: false, desc: "Solo mostrar viabilidad sin ejecutar"
+      end
+      route_param :id do
+        post :restore do
+          vehicle_km = VehicleKm.discarded.find(params[:id])
+
+          # Preparar opciones
+          options = {}
+          if params[:reassign_to].present?
+            options[:reassign_to] = params[:reassign_to].symbolize_keys
+          end
+
+          # Crear coordinador
+          coordinator = SoftDelete::RestorationCoordinator.new(vehicle_km, options)
+
+          # Si se pide preview, solo analizar
+          if params[:preview]
+            preview = coordinator.preview
+            return present({
+              success: true,
+              preview: preview,
+              vehicle_km_id: vehicle_km.id
+            })
+          end
+
+          # Ejecutar restauración
+          result = coordinator.call
+
+          if result[:success]
+            present({
+              success: true,
+              message: result[:message],
+              vehicle_km: present(result[:record], with: Entities::VehicleKmDetailEntity),
+              restored_count: result[:restored_count]
+            })
+          else
+            error!({
+              success: false,
+              errors: result[:errors],
+              message: result[:message],
+              conflicts: result[:conflicts],
+              required_decisions: result[:required_decisions]
+            }, 422)
+          end
+        end
+      end
+
+      desc "Verificar si un registro puede ser eliminado"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+      end
+      route_param :id do
+        get :can_delete do
+          vehicle_km = VehicleKm.kept.find(params[:id])
+          impact = vehicle_km.deletion_impact
+
+          present({
+            success: true,
+            can_delete: vehicle_km.can_be_deleted?,
+            requires_force: impact[:warnings].any?,
+            impact: impact
+          })
+        end
+      end
+
+      desc "Verificar si un registro eliminado puede ser restaurado"
+      params do
+        requires :id, type: Integer, desc: "ID del registro eliminado"
+      end
+      route_param :id do
+        get :can_restore do
+          vehicle_km = VehicleKm.discarded.find(params[:id])
+          info = vehicle_km.restoration_info
+
+          present({
+            success: true,
+            can_restore: vehicle_km.can_be_restored?,
+            restoration_info: info
+          })
+        end
+      end
+
+      desc "Verificar correlación de un registro"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+      end
+      route_param :id do
+        get :check_correlation do
+          km = VehicleKm.kept.find(params[:id])
+
+          detector = VehicleKms::ConflictDetectorService.new(km)
+          result = detector.call
+
+          prev_record = find_immediate_previous(km)
+          next_record = find_immediate_next(km)
+
+          {
+            vehicle_km_id: km.id,
+            current_status: km.status,
+            has_conflict: result[:has_conflict],
+            current_is_conflictive: result[:current_is_conflictive],
+            conflictive_records_count: result[:conflictive_records].size,
+            valid_records_count: result[:valid_records].size,
+            previous_record: prev_record ? {
+              id: prev_record.id,
+              input_date: prev_record.input_date,
+              effective_km: prev_record.effective_km,
+              status: prev_record.status
+            } : nil,
+            next_record: next_record ? {
+              id: next_record.id,
+              input_date: next_record.input_date,
+              effective_km: next_record.effective_km,
+              status: next_record.status
+            } : nil
+          }
+        end
+      end
+
+      desc "Intentar corrección automática de un registro conflictivo"
+      params do
+        requires :id, type: Integer, desc: "ID del registro"
+      end
+      route_param :id do
+        post :attempt_correction do
+          km = VehicleKm.kept.find(params[:id])
+
+          unless km.status == "conflictivo"
+            error!({
+              success: false,
+              errors: [ "Solo se pueden corregir registros conflictivos" ]
+            }, 422)
+          end
+
+          corrector = VehicleKms::KmCorrectionService.new(km)
+          result = corrector.call
+
+          if result[:success] && result[:corrected_km]
+            km.update!(
+              km_normalized: result[:corrected_km],
+              status: "corregido",
+              conflict_reasons_list: [],
+              correction_notes: result[:notes]
+            )
+
+            {
+              success: true,
+              message: "Corrección aplicada exitosamente",
+              vehicle_km: present(km.reload, with: Entities::VehicleKmDetailEntity),
+              correction_summary: {
+                original_km: km.km_reported,
+                corrected_km: result[:corrected_km],
+                difference: result[:corrected_km] - km.km_reported,
+                method: result[:method]
+              }
+            }
+          else
+            error!({
+              success: false,
+              errors: [ "No se pudo calcular una corrección válida" ],
+              details: result[:notes]
+            }, 422)
+          end
+        end
+      end
+
+      desc "Recalcular correcciones para un vehículo completo"
+      params do
+        requires :vehicle_id, type: Integer, desc: "ID del vehículo"
+        optional :only_conflictive, type: Boolean, default: true, desc: "Solo recalcular registros conflictivos"
+      end
+      post :recalculate do
+        vehicle = Vehicle.kept.find(params[:vehicle_id])
+        kms = VehicleKm.kept
+          .where(vehicle_id: vehicle.id)
+          .order(input_date: :asc, created_at: :asc)
+
+        kms = kms.where(status: "conflictivo") if params[:only_conflictive]
+
+        results = {
+          total_processed: 0,
+          corrected: 0,
+          still_conflictive: 0,
+          errors: []
+        }
+
+        kms.each do |km|
+          results[:total_processed] += 1
+
+          begin
+            corrector = VehicleKms::KmCorrectionService.new(km)
+            correction_result = corrector.call
+
+            if correction_result[:success] && correction_result[:corrected_km]
+              km.update!(
+                km_normalized: correction_result[:corrected_km],
+                status: "corregido",
+                conflict_reasons_list: [],
+                correction_notes: correction_result[:notes]
+              )
+              results[:corrected] += 1
+            else
+              results[:still_conflictive] += 1
+            end
+          rescue StandardError => e
+            results[:errors] << { km_id: km.id, error: e.message }
+            results[:still_conflictive] += 1
+          end
+        end
+
+        {
+          success: true,
+          message: "Procesados #{results[:total_processed]} registros, #{results[:corrected]} corregidos",
+          details: results
+        }
+      end
+
+      desc "Obtener estadísticas de KM por vehículo"
+      params do
+        requires :vehicle_id, type: Integer, desc: "ID del vehículo"
+      end
+      get :stats do
+        vehicle = Vehicle.kept.find(params[:vehicle_id])
+        present vehicle.km_stats.merge(
+          vehicle_id: vehicle.id,
+          vehicle_matricula: vehicle.matricula
+        )
+      end
+
+      desc "Obtener lista de vehículos con registros conflictivos"
+      params do
+        optional :company_id, type: Integer, desc: "Filtrar por compañía"
+        optional :min_conflictive, type: Integer, default: 1, desc: "Mínimo de registros conflictivos"
+      end
+      get :conflictives_summary do
+        vehicles = Vehicle.kept.includes(:vehicle_kms)
+        vehicles = vehicles.where(company_id: params[:company_id]) if params[:company_id]
+
+        results = vehicles.map do |vehicle|
+          total = vehicle.vehicle_kms.kept.count
+          conflictive = vehicle.vehicle_kms.kept.where(status: "conflictivo").count
+
+          next if conflictive < params[:min_conflictive]
+
+          {
+            vehicle_id: vehicle.id,
+            vehicle_matricula: vehicle.matricula,
+            vehicle_vin: vehicle.vin,
+            total_records: total,
+            conflictive_count: conflictive,
+            conflictive_percentage: total > 0 ? ((conflictive.to_f / total) * 100).round(2) : 0,
+            oldest_conflict: vehicle.vehicle_kms.kept
+              .where(status: "conflictivo")
+              .minimum(:input_date),
+            newest_conflict: vehicle.vehicle_kms.kept
+              .where(status: "conflictivo")
+              .maximum(:input_date)
+          }
+        end.compact.sort_by { |r| -r[:conflictive_count] }
+
+        {
+          total_vehicles: vehicles.count,
+          vehicles_with_conflicts: results.count,
+          total_conflictive_records: results.sum { |r| r[:conflictive_count] },
+          vehicles: results
+        }
+      end
+    end
+
+    helpers do
+      def find_immediate_previous(vehicle_km)
+        VehicleKm.kept
+          .where(vehicle_id: vehicle_km.vehicle_id)
+          .where("input_date < ? OR (input_date = ? AND id < ?)",
+                 vehicle_km.input_date,
+                 vehicle_km.input_date,
+                 vehicle_km.id)
+          .order(input_date: :desc, id: :desc)
+          .first
+      end
+
+      def find_immediate_next(vehicle_km)
+        VehicleKm.kept
+          .where(vehicle_id: vehicle_km.vehicle_id)
+          .where("input_date > ? OR (input_date = ? AND id > ?)",
+                 vehicle_km.input_date,
+                 vehicle_km.input_date,
+                 vehicle_km.id)
+          .order(input_date: :asc, id: :asc)
+          .first
+      end
+    end
+  end
+end

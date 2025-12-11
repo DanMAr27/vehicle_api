@@ -1,0 +1,424 @@
+# app/api/entities/company_entity.rb
+
+module Entities
+  class CompanyEntity < Grape::Entity
+    expose :id
+    expose :name
+    expose :cif
+    expose :created_at
+    expose :updated_at
+
+    # Campos de configuración de KM
+    expose :max_daily_km_tolerance, documentation: {
+      desc: "Máximo de km diarios permitido antes de marcar como conflicto (null = sin validación)"
+    }
+
+    # Estadísticas (opcional)
+    expose :km_stats, if: { include_stats: true } do |company|
+      company.km_stats
+    end
+  end
+end
+
+# app/api/entities/error_entity.rb
+module Entities
+  class ErrorEntity < Grape::Entity
+    expose :success, default: false
+    expose :errors
+    expose :message
+  end
+end
+
+# app/api/entities/maintenance_detail_entity.rb
+
+module Entities
+  class MaintenanceDetailEntity < MaintenanceEntity
+    expose :vehicle, using: Entities::VehicleEntity
+
+    # Estado detallado del registro de KM
+    expose :km_info do |maintenance, options|
+      vehicle_km = maintenance.vehicle_km
+
+      base_info = {
+        km_status: maintenance.km_status,
+        manually_reported: maintenance.km_manually_reported?,
+        desynchronized: maintenance.km_desynchronized?,
+        registered_km: maintenance.register_km,
+        has_km_record: vehicle_km.present?
+      }
+
+      if vehicle_km
+        base_info.merge!(
+          vehicle_km_id: vehicle_km.id,
+          current_effective_km: vehicle_km.effective_km,
+          difference: maintenance.km_difference,
+          vehicle_km_status: vehicle_km.status,
+          is_conflictive: vehicle_km.status == "conflictivo",
+          is_corrected: vehicle_km.status == "corregido",
+          is_edited: vehicle_km.status == "editado"
+        )
+      end
+
+      base_info
+    end
+
+    # Información del registro de KM asociado (si existe)
+    expose :vehicle_km_detail, if: ->(maintenance, _) { maintenance.vehicle_km.present? } do
+      expose :vehicle_km, using: Entities::VehicleKmDetailEntity
+
+      # Historial de cambios del KM (si existe PaperTrail)
+      expose :km_history, if: ->(maintenance, _) { maintenance.vehicle_km&.respond_to?(:versions) } do |maintenance|
+        maintenance.vehicle_km.versions.map do |v|
+          {
+            event: v.event,
+            created_at: v.created_at,
+            changes: v.changeset
+          }
+        end
+      end
+    end
+
+    # Historial de cambios del mantenimiento
+    expose :maintenance_history, if: ->(maintenance, _) { maintenance.respond_to?(:versions) } do |maintenance|
+      maintenance.versions.map do |v|
+        {
+          event: v.event,
+          created_at: v.created_at,
+          changes: v.changeset,
+          whodunnit: v.whodunnit
+        }
+      end
+    end
+
+    # Alertas y advertencias actualizadas
+    expose :alerts do |maintenance, options|
+      alerts = []
+      vehicle_km = maintenance.vehicle_km
+
+      # Alerta: KM eliminado
+      if maintenance.km_status == "eliminado"
+        alerts << {
+          type: "warning",
+          severity: "high",
+          message: "El registro de KM asociado ha sido eliminado",
+          detail: "El kilometraje registrado en este mantenimiento ya no está vinculado al histórico del vehículo"
+        }
+      end
+
+      # Alerta: Sin registro de KM
+      if maintenance.km_status == "sin_registro"
+        alerts << {
+          type: "info",
+          severity: "low",
+          message: "Este mantenimiento no tiene registro de KM asociado",
+          detail: "El kilometraje solo está registrado en el mantenimiento, no en el histórico general"
+        }
+      end
+
+      # Alerta: KM desincronizado
+      if maintenance.km_desynchronized? && vehicle_km
+        km_diff = maintenance.km_difference
+        alerts << {
+          type: "warning",
+          severity: "medium",
+          message: "Kilometraje desincronizado",
+          detail: "El KM del mantenimiento (#{maintenance.register_km}) difiere del registro histórico (#{vehicle_km.effective_km}). Diferencia: #{km_diff} km"
+        }
+      end
+
+      # Alerta: KM conflictivo
+      if vehicle_km&.status == "conflictivo"
+        alerts << {
+          type: "error",
+          severity: "high",
+          message: "Registro de kilometraje conflictivo",
+          detail: "El registro de KM tiene conflictos que requieren revisión manual",
+          conflict_reasons: vehicle_km.conflict_reasons_list
+        }
+      end
+
+      # Alerta: KM corregido automáticamente
+      if vehicle_km&.status == "corregido"
+        alerts << {
+          type: "info",
+          severity: "low",
+          message: "Kilometraje corregido automáticamente",
+          detail: vehicle_km.correction_notes
+        }
+      end
+
+      # Alerta: KM editado manualmente
+      if vehicle_km&.status == "editado"
+        alerts << {
+          type: "info",
+          severity: "low",
+          message: "Kilometraje editado manualmente",
+          detail: vehicle_km.correction_notes
+        }
+      end
+
+      alerts
+    end
+  end
+end
+
+# app/api/entities/maintenance_entity.rb
+
+module Entities
+  class MaintenanceEntity < Grape::Entity
+    expose :id
+    expose :maintenance_date
+    expose :register_km
+    expose :amount
+    expose :description
+    expose :vehicle_id
+    expose :company_id
+    expose :created_at
+    expose :updated_at
+    expose :discarded_at
+
+    # Estado del KM asociado
+    expose :km_status do |maintenance|
+      maintenance.km_status
+    end
+
+    # Información básica del KM asociado
+    expose :has_km_record do |maintenance|
+      maintenance.vehicle_km.present?
+    end
+
+    expose :km_is_conflictive do |maintenance|
+      maintenance.km_conflictive?
+    end
+
+    expose :km_is_desynchronized do |maintenance|
+      maintenance.km_desynchronized?
+    end
+
+    # Relaciones opcionales
+    expose :vehicle, using: Entities::VehicleEntity, if: { include_vehicle: true }
+    expose :vehicle_km, using: Entities::VehicleKmEntity, if: { include_vehicle_km: true }
+  end
+end
+
+# app/api/entities/success_entity.rb
+module Entities
+  class SuccessEntity < Grape::Entity
+    expose :success, default: true
+    expose :message
+    expose :data
+  end
+end
+
+# app/api/entities/vehicle_entity.rb
+
+module Entities
+  class VehicleEntity < Grape::Entity
+    expose :id
+    expose :matricula
+    expose :vin
+    expose :current_km
+    expose :company, using: Entities::CompanyEntity
+    expose :created_at
+    expose :updated_at
+
+    # Indicadores de estado
+    expose :has_conflictive_kms do |vehicle|
+      vehicle.has_conflictive_kms?
+    end
+
+    # Estadísticas básicas (opcional)
+    expose :km_stats, if: { include_stats: true } do |vehicle|
+      vehicle.km_stats
+    end
+  end
+end
+
+# app/api/entities/vehicle_km_detail_entity.rb
+
+module Entities
+  class VehicleKmDetailEntity < VehicleKmEntity
+    # Información de conflictos detallada
+    expose :conflict_analysis do |vehicle_km, options|
+      detector = VehicleKms::ConflictDetectorService.new(vehicle_km)
+      result = detector.call
+
+      {
+        has_conflict: result[:has_conflict],
+        current_is_conflictive: result[:current_is_conflictive],
+        conflictive_records: result[:conflictive_records].map do |conflict|
+          {
+            record_id: conflict[:record_id],
+            date: conflict[:date],
+            km: conflict[:km],
+            reasons: conflict[:reasons]
+          }
+        end,
+        valid_records_count: result[:valid_records].size
+      }
+    end
+
+    # Información de corrección potencial
+    expose :correction_info, if: ->(vehicle_km, _) {
+      vehicle_km.status == "conflictivo"
+    } do |vehicle_km|
+      corrector = VehicleKms::KmCorrectionService.new(vehicle_km)
+      result = corrector.call
+
+      {
+        can_be_corrected: result[:success],
+        suggested_km: result[:corrected_km],
+        correction_method: result[:method],
+        notes: result[:notes]
+      }
+    end
+
+    # Comparación entre KM reportado y normalizado
+    expose :correction_summary, if: ->(vehicle_km, _) {
+      vehicle_km.status == "corregido"
+    } do |vehicle_km|
+      {
+        original_km: vehicle_km.km_reported,
+        corrected_km: vehicle_km.km_normalized,
+        difference: vehicle_km.correction_difference,
+        difference_percentage: vehicle_km.correction_percentage,
+        correction_notes: vehicle_km.correction_notes
+      }
+    end
+
+    # Contexto de registros vecinos
+    expose :neighbor_context do |vehicle_km|
+      vehicle = vehicle_km.vehicle
+
+      previous = VehicleKm.kept
+        .where(vehicle_id: vehicle.id)
+        .where("input_date < ? OR (input_date = ? AND id < ?)",
+               vehicle_km.input_date, vehicle_km.input_date, vehicle_km.id)
+        .order(input_date: :desc, id: :desc)
+        .first
+
+      next_record = VehicleKm.kept
+        .where(vehicle_id: vehicle.id)
+        .where("input_date > ? OR (input_date = ? AND id > ?)",
+               vehicle_km.input_date, vehicle_km.input_date, vehicle_km.id)
+        .order(input_date: :asc, id: :asc)
+        .first
+
+      {
+        previous_record: previous ? {
+          id: previous.id,
+          input_date: previous.input_date,
+          km: previous.effective_km,
+          status: previous.status
+        } : nil,
+        next_record: next_record ? {
+          id: next_record.id,
+          input_date: next_record.input_date,
+          km: next_record.effective_km,
+          status: next_record.status
+        } : nil
+      }
+    end
+
+    # Historial de versiones (si existe PaperTrail)
+    expose :version_history, if: ->(vehicle_km, _) {
+      vehicle_km.respond_to?(:versions)
+    } do |vehicle_km|
+      vehicle_km.versions.last(10).map do |v|
+        {
+          event: v.event,
+          created_at: v.created_at,
+          whodunnit: v.whodunnit,
+          changes: v.changeset
+        }
+      end
+    end
+  end
+end
+
+# app/api/entities/vehicle_km_entity.rb
+
+module Entities
+  class VehicleKmEntity < Grape::Entity
+    expose :id
+    expose :input_date
+    expose :km_reported, documentation: { desc: "KM reportado originalmente" }
+    expose :km_normalized, documentation: { desc: "KM normalizado/corregido por el sistema" }
+
+    # Campo calculado para mantener retrocompatibilidad
+    expose :effective_km, documentation: {
+      desc: "KM efectivo (normalizado si existe, reportado si no)"
+    } do |vehicle_km|
+      vehicle_km.effective_km
+    end
+
+    expose :status, documentation: {
+      desc: "Estado del registro",
+      values: [ "original", "corregido", "editado", "conflictivo" ]
+    }
+
+    expose :correction_notes, documentation: {
+      desc: "Notas sobre la corrección/conflicto aplicada"
+    }
+
+    expose :conflict_reasons_list, as: :conflict_reasons, documentation: {
+      desc: "Lista de razones del conflicto (array)"
+    }
+
+    # Información del origen (polimórfico)
+    expose :source_info do |vehicle_km|
+      if vehicle_km.source_record.nil?
+        { type: "manual", description: "Registro manual" }
+      else
+        {
+          type: vehicle_km.source_record_type,
+          id: vehicle_km.source_record_id,
+          description: vehicle_km.source_description
+        }
+      end
+    end
+
+    # Exponer source_record si se solicita
+    expose :source_record, if: { include_source: true } do |vehicle_km|
+      case vehicle_km.source_record_type
+      when "Maintenance"
+        Entities::MaintenanceEntity.represent(vehicle_km.source_record) if vehicle_km.source_record
+      else
+        nil
+      end
+    end
+
+    expose :vehicle_id
+    expose :company_id
+    expose :created_at
+    expose :updated_at
+    expose :discarded_at
+
+    # Información del vehículo (opcional)
+    expose :vehicle, using: Entities::VehicleEntity, if: { include_vehicle: true }
+
+    # Indicador visual del estado
+    expose :needs_review, documentation: {
+      desc: "Indica si el registro requiere revisión manual"
+    } do |vehicle_km|
+      vehicle_km.needs_review?
+    end
+
+    # Indicadores de estado
+    expose :is_manual do |vehicle_km|
+      vehicle_km.manually_created?
+    end
+
+    expose :is_from_maintenance do |vehicle_km|
+      vehicle_km.from_maintenance?
+    end
+
+    expose :is_auto_corrected do |vehicle_km|
+      vehicle_km.auto_corrected?
+    end
+
+    expose :is_manually_edited do |vehicle_km|
+      vehicle_km.manually_edited?
+    end
+  end
+end
